@@ -46,7 +46,11 @@ func TestLocalhost(t *testing.T) {
 	if !setup(t) {
 		return
 	}
-	testWithClient(t, New(testServer))
+	c := New(testServer)
+	testWithClient(t, c)
+	if c.GetServer() != testServer {
+		t.Errorf("Expected server to be %q, got %q", testServer, c.GetServer())
+	}
 }
 
 // Run the memcached binary as a child process and connect to its unix socket.

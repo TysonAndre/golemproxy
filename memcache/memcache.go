@@ -122,7 +122,10 @@ func New(server string) *Client {
 		panic(fmt.Sprintf("Failed to resolve %s", server))
 	}
 
-	return &Client{addr: addr}
+	return &Client{
+		addr:       addr,
+		serverRepr: server,
+	}
 }
 
 // Client is a memcache client.
@@ -139,6 +142,9 @@ type Client struct {
 	// Consider your expected traffic rates and latency carefully. This should
 	// be set to a number higher than your peak parallel requests.
 	MaxIdleConns int
+
+	// The original server address, useful for debugging
+	serverRepr string
 
 	addr net.Addr
 
@@ -619,4 +625,9 @@ func (c *Client) incrDecr(verb, key string, delta uint64) (uint64, error) {
 		return nil
 	})
 	return val, err
+}
+
+// GetServer returns the address of the server originally passed to memcache.New().
+func (c *Client) GetServer() string {
+	return c.serverRepr
 }
