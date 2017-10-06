@@ -109,7 +109,6 @@ var (
 	resultNotFound  = []byte("NOT_FOUND\r\n")
 	resultDeleted   = []byte("DELETED\r\n")
 	resultEnd       = []byte("END\r\n")
-	resultOk        = []byte("OK\r\n")
 	resultTouched   = []byte("TOUCHED\r\n")
 
 	resultClientErrorPrefix = []byte("CLIENT_ERROR ")
@@ -361,7 +360,7 @@ func (c *Client) flushAll() error {
 			return err
 		}
 		switch {
-		case bytes.Equal(line, resultOk):
+		case bytes.Equal(line, resultOK):
 			break
 		default:
 			return fmt.Errorf("memcache: unexpected response line from flush_all: %q", string(line))
