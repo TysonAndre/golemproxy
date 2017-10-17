@@ -317,40 +317,39 @@ func (c *Client) Touch(key string, seconds int32) (err error) {
 	return c.touch([]string{key}, seconds)
 }
 
-func (c *Client) withConnFromPool(fn func(*bufio.ReadWriter) error) (err error) {
+func (c *Client) withConnFromPool(dataToWrite string, readFn func(*bufio.Reader) error) (err error) {
 	cn, err := c.getConn()
 	if err != nil {
 		return err
 	}
 	defer cn.condRelease(err)
-	return fn(cn.rw)
+	_, writeErr := cn.rw.Writer.WriteString(dataToWrite)
+	if writeErr != nil {
+		// Should be guaranteed to cause connection to close
+		return writeErr
+	}
+	// TODO: If we always flush, just write the raw string, then? (Micro-optimization)
+	flushErr := cn.rw.Writer.Flush()
+	if flushErr != nil {
+		return flushErr
+	}
+	// TODO: What happens if twemproxy or the memcache connection keeps the connection open, but fails to send a line?
+	//       Add some sort of tracking of how many pending requests there are per socket (e.g. go channel max size of 100)?
+	// TODO: pipeline this call, e.g. via awaiting a channel. Make sure the connection is released before we start reading.
+	return readFn(cn.rw.Reader)
 }
 
 func (c *Client) get(keys []string, cb func(*Item)) error {
-	return c.withConnFromPool(func(rw *bufio.ReadWriter) error {
-		if _, err := fmt.Fprintf(rw, "gets %s\r\n", strings.Join(keys, " ")); err != nil {
-			return err
-		}
-		if err := rw.Flush(); err != nil {
-			return err
-		}
-		if err := parseGetResponse(rw.Reader, cb); err != nil {
-			return err
-		}
-		return nil
+	writeCmd := "gets " + strings.Join(keys, " ") + "\r\n"
+	return c.withConnFromPool(writeCmd, func(r *bufio.Reader) error {
+		return parseGetResponse(r, cb)
 	})
 }
 
 // flushAll sends the flush_all command to c.addr
 func (c *Client) flushAll() error {
-	return c.withConnFromPool(func(rw *bufio.ReadWriter) error {
-		if _, err := fmt.Fprintf(rw, "flush_all\r\n"); err != nil {
-			return err
-		}
-		if err := rw.Flush(); err != nil {
-			return err
-		}
-		line, err := rw.ReadSlice('\n')
+	return c.withConnFromPool("flush_all\r\n", func(r *bufio.Reader) error {
+		line, err := r.ReadSlice('\n')
 		if err != nil {
 			return err
 		}
@@ -365,15 +364,18 @@ func (c *Client) flushAll() error {
 }
 
 func (c *Client) touch(keys []string, expiration int32) error {
-	return c.withConnFromPool(func(rw *bufio.ReadWriter) error {
-		for _, key := range keys {
-			if _, err := fmt.Fprintf(rw, "touch %s %d\r\n", key, expiration); err != nil {
-				return err
-			}
-			if err := rw.Flush(); err != nil {
-				return err
-			}
-			line, err := rw.ReadSlice('\n')
+	buf := bytes.NewBuffer(nil)
+	for _, key := range keys {
+		if _, err := fmt.Fprintf(buf, "touch %s %d\r\n", key, expiration); err != nil {
+			return err
+		}
+	}
+
+	return c.withConnFromPool(buf.String(), func(r *bufio.Reader) error {
+		// Process results in same order as written
+		var err error
+		for range keys {
+			line, err := r.ReadSlice('\n')
 			if err != nil {
 				return err
 			}
@@ -381,12 +383,14 @@ func (c *Client) touch(keys []string, expiration int32) error {
 			case bytes.Equal(line, resultTouched):
 				break
 			case bytes.Equal(line, resultNotFound):
-				return ErrCacheMiss
+				err = ErrCacheMiss
 			default:
+				// This failed, tell the pool to close the connection
 				return fmt.Errorf("memcache: unexpected response line from touch: %q", string(line))
 			}
 		}
-		return nil
+		// Return ErrCacheMiss if any of these missed.
+		return err
 	})
 }
 
@@ -544,8 +548,8 @@ func writeReadLine(rw *bufio.ReadWriter, format string, args ...interface{}) ([]
 	return line, err
 }
 
-func writeExpectf(rw *bufio.ReadWriter, expect []byte, format string, args ...interface{}) error {
-	line, err := writeReadLine(rw, format, args...)
+func readLineAndExpect(r *bufio.Reader, expect []byte) error {
+	line, err := r.ReadSlice('\n')
 	if err != nil {
 		return err
 	}
@@ -567,15 +571,15 @@ func writeExpectf(rw *bufio.ReadWriter, expect []byte, format string, args ...in
 // Delete deletes the item with the provided key. The error ErrCacheMiss is
 // returned if the item didn't already exist in the cache.
 func (c *Client) Delete(key string) error {
-	return c.withConnFromPool(func(rw *bufio.ReadWriter) error {
-		return writeExpectf(rw, resultDeleted, "delete %s\r\n", key)
+	return c.withConnFromPool("delete "+key+"\r\n", func(r *bufio.Reader) error {
+		return readLineAndExpect(r, resultDeleted)
 	})
 }
 
 // DeleteAll deletes all items in the cache.
 func (c *Client) DeleteAll() error {
-	return c.withConnFromPool(func(rw *bufio.ReadWriter) error {
-		return writeExpectf(rw, resultDeleted, "flush_all\r\n")
+	return c.withConnFromPool("flush_all\r\n", func(r *bufio.Reader) error {
+		return readLineAndExpect(r, resultDeleted)
 	})
 }
 
@@ -600,8 +604,9 @@ func (c *Client) Decrement(key string, delta uint64) (newValue uint64, err error
 
 func (c *Client) incrDecr(verb, key string, delta uint64) (uint64, error) {
 	var val uint64
-	err := c.withConnFromPool(func(rw *bufio.ReadWriter) error {
-		line, err := writeReadLine(rw, "%s %s %d\r\n", verb, key, delta)
+	writeString := fmt.Sprintf("%s %s %d\r\n", verb, key, delta)
+	err := c.withConnFromPool(writeString, func(r *bufio.Reader) error {
+		line, err := r.ReadSlice('\n')
 		if err != nil {
 			return err
 		}
