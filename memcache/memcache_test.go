@@ -18,24 +18,28 @@ limitations under the License.
 package memcache
 
 import (
-	"bufio"
 	"fmt"
-	"io"
-	"io/ioutil"
 	"net"
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
 
-const testServer = "localhost:11211"
+const localTestServer = "127.0.0.1:11211"
+const benchTestServer = "127.0.0.1:11211"
 
-func setup(t *testing.T) bool {
-	c, err := net.Dial("tcp", testServer)
+type skippable interface {
+	Skipf(format string, args ...interface{})
+}
+
+func setupLocalTestServer(t skippable) bool {
+	c, err := net.Dial("tcp", localTestServer)
 	if err != nil {
-		t.Skipf("skipping test; no server running at %s", testServer)
+		t.Skipf("skipping test; no server running at %s", localTestServer)
+		return false
 	}
 	c.Write([]byte("flush_all\r\n"))
 	c.Close()
@@ -43,13 +47,13 @@ func setup(t *testing.T) bool {
 }
 
 func TestLocalhost(t *testing.T) {
-	if !setup(t) {
+	if !setupLocalTestServer(t) {
 		return
 	}
-	c := New(testServer)
+	c := New(localTestServer)
 	testWithClient(t, c)
-	if c.GetServer() != testServer {
-		t.Errorf("Expected server to be %q, got %q", testServer, c.GetServer())
+	if c.GetServer() != localTestServer {
+		t.Errorf("Expected server to be %q, got %q", localTestServer, c.GetServer())
 	}
 }
 
@@ -72,7 +76,8 @@ func TestUnixSocket(t *testing.T) {
 		time.Sleep(time.Duration(25*i) * time.Millisecond)
 	}
 
-	testWithClient(t, New(sock))
+	c := New(sock)
+	testWithClient(t, c)
 }
 
 func mustSetF(t *testing.T, c *Client) func(*Item) {
@@ -81,6 +86,11 @@ func mustSetF(t *testing.T, c *Client) func(*Item) {
 			t.Fatalf("failed to Set %#v: %v", *it, err)
 		}
 	}
+}
+
+func debugPrintf(format string, args ...interface{}) {
+	// Uncomment in order to diagnose issues with this hanging.
+	// fmt.Printf(format, args...)
 }
 
 func testWithClient(t *testing.T, c *Client) {
@@ -92,14 +102,18 @@ func testWithClient(t *testing.T, c *Client) {
 	mustSet := mustSetF(t, c)
 
 	// Set
+	debugPrintf("Calling set\n")
 	foo := &Item{Key: "foo", Value: []byte("fooval"), Flags: 123}
 	err := c.Set(foo)
+	debugPrintf("Done calling set err: %v\n", err)
 	checkErr(err, "first set(foo): %v", err)
 	err = c.Set(foo)
+	debugPrintf("Done calling set again err: %v\n", err)
 	checkErr(err, "second set(foo): %v", err)
 
 	// Get
 	it, err := c.Get("foo")
+	debugPrintf("Calling get\n")
 	checkErr(err, "get(foo): %v", err)
 	if it.Key != "foo" {
 		t.Errorf("get(foo) Key = %q, want foo", it.Key)
@@ -110,6 +124,7 @@ func testWithClient(t *testing.T, c *Client) {
 	if it.Flags != 123 {
 		t.Errorf("get(foo) Flags = %v, want 123", it.Flags)
 	}
+	debugPrintf("Done calling get\n")
 
 	// Get and set a unicode key
 	quxKey := "Hello_世界"
@@ -124,6 +139,7 @@ func testWithClient(t *testing.T, c *Client) {
 	if string(it.Value) != "hello world" {
 		t.Errorf("get(Hello_世界) Value = %q, want hello world", string(it.Value))
 	}
+	debugPrintf("Done calling get and set\n")
 
 	// Set malformed keys
 	malFormed := &Item{Key: "foo bar", Value: []byte("foobarval")}
@@ -136,6 +152,7 @@ func testWithClient(t *testing.T, c *Client) {
 	if err != ErrMalformedKey {
 		t.Errorf("set(foo<0x7f>) should return ErrMalformedKey instead of %v", err)
 	}
+	debugPrintf("Done calling set with malformed keys\n")
 
 	// Add
 	bar := &Item{Key: "bar", Value: []byte("barval")}
@@ -152,6 +169,7 @@ func testWithClient(t *testing.T, c *Client) {
 	}
 	err = c.Replace(bar)
 	checkErr(err, "replaced(foo): %v", err)
+	debugPrintf("Done calling replace\n")
 
 	// GetMulti
 	m, err := c.GetMulti([]string{"foo", "bar"})
@@ -171,6 +189,7 @@ func testWithClient(t *testing.T, c *Client) {
 	if g, e := string(m["bar"].Value), "barval"; g != e {
 		t.Errorf("GetMulti: bar: got %q, want %q", g, e)
 	}
+	debugPrintf("Done calling GetMulti\n")
 
 	// Delete
 	err = c.Delete("foo")
@@ -179,6 +198,7 @@ func testWithClient(t *testing.T, c *Client) {
 	if err != ErrCacheMiss {
 		t.Errorf("post-Delete want ErrCacheMiss, got %v", err)
 	}
+	debugPrintf("Done calling Delete\n")
 
 	// Incr/Decr
 	mustSet(&Item{Key: "num", Value: []byte("42")})
@@ -262,32 +282,61 @@ func testTouchWithClient(t *testing.T, c *Client) {
 	}
 }
 
-func BenchmarkOnItem(b *testing.B) {
-	fakeServer, err := net.Listen("tcp", "localhost:0")
+func checkCanBench(b skippable) bool {
+	c, err := net.Dial("tcp", benchTestServer)
 	if err != nil {
-		b.Fatal("Could not open fake server: ", err)
+		b.Skipf("skipping test; no server running at %s", localTestServer)
+		return false
 	}
-	defer fakeServer.Close()
-	go func() {
-		for {
-			if c, err := fakeServer.Accept(); err == nil {
-				go func() { io.Copy(ioutil.Discard, c) }()
-			} else {
-				return
-			}
+	c.Close()
+	return true
+}
+
+func BenchmarkSetGet(b *testing.B) {
+	if !checkCanBench(b) {
+		return
+	}
+	benchmarkWorkerCount := 20
+	// Don't call flush_all
+	c := New(benchTestServer)
+	c.MaxIdleConns = benchmarkWorkerCount + 1
+
+	checkErr := func(err error, format string, args ...interface{}) {
+		if err != nil {
+			b.Fatalf(format, args...)
 		}
-	}()
-
-	addr := fakeServer.Addr()
-	c := New(addr.String())
-	if _, err := c.getConn(); err != nil {
-		b.Fatal("failed to initialize connection to fake server")
 	}
 
-	item := Item{Key: "foo"}
-	dummyFn := func(_ *Client, _ *bufio.ReadWriter, _ *Item) error { return nil }
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		c.onItem(&item, dummyFn)
+	N := b.N
+	wg := sync.WaitGroup{}
+	wg.Add(benchmarkWorkerCount)
+	for j := 0; j < benchmarkWorkerCount; j++ {
+		j := j
+		go func() {
+			defer wg.Done()
+			expectedKey := fmt.Sprintf("foo%d", j+100)
+			for i := 0; i < N; i++ {
+				expectedValue := fmt.Sprintf("foo%d", i+10000000)
+
+				// Set
+				foo := &Item{Key: expectedKey, Value: []byte(expectedValue), Flags: 123}
+				err := c.Set(foo)
+				checkErr(err, "first set(%s): %v", expectedKey, err)
+
+				// Get
+				it, err := c.Get(expectedKey)
+				checkErr(err, "get(%s): %v", expectedKey, err)
+				if it.Key != expectedKey {
+					b.Errorf("get(%s) Key = %q, want %s", expectedKey, it.Key, expectedKey)
+				}
+				if string(it.Value) != expectedValue {
+					b.Errorf("get(%s) Value = %q, want %s", expectedKey, string(it.Value), expectedValue)
+				}
+				if it.Flags != 123 {
+					b.Errorf("get(foo) Flags = %v, want 123", it.Flags)
+				}
+			}
+		}()
 	}
+	wg.Wait()
 }

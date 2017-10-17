@@ -147,6 +147,7 @@ type Client struct {
 
 	addr net.Addr
 
+	// This locks access to the free list of connections
 	lk       sync.Mutex
 	freelist []*conn
 }
