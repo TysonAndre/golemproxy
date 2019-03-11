@@ -1,8 +1,10 @@
 package memcache
 
 import (
-	"bufio"
 	"errors"
+	"fmt"
+	"sync"
+	"time"
 )
 
 const (
@@ -41,7 +43,7 @@ type workRequest struct {
 	DataToWrite string
 	// A callback which synchronously reads a non-zero number of bytes from r
 	// (e.g. to process the result of a memcached Get request made earlier by the worker.)
-	ResponseCB func(r *bufio.Reader) error
+	ResponseCB func(r *BufferedReader) error
 	// TODO: RetryCB instead?
 	// // remaining number of times this will retry (0 = no retries)
 
@@ -53,19 +55,23 @@ type workRequest struct {
 type workFinalizeRequest struct {
 	// A callback which synchronously reads a non-zero number of bytes from r
 	// (e.g. to process the result of a memcached Get request made earlier by the worker.)
-	ResponseCB func(r *bufio.Reader) error
+	ResponseCB func(r *BufferedReader) error
 	// // remaining number of times this will retry if the request wasn't sent (0 = no retries)
 	//RemainingRetryCount int
 
 	// Channel on which to send error or success, then close
 	errChan chan<- error
+	// The reader corresponding to the writer this request was written on.
+	// This is needed to gracefully handle old requests when reconnecting.
+	reader *BufferedReader
 }
 
 func InitWorkerManager(manager *WorkerManager, maxWorkers int, connFactory ConnectionFactory) {
+	// FIXME support multiple workers
 	if maxWorkers < 3 {
 		maxWorkers = 3
 	}
-	manager.maxWorkers = maxWorkers
+	maxWorkers = 1
 	manager.createdWorkerCount = 0
 	manager.workChan = make(chan *workRequest, MAX_BACKLOG_SIZE)
 	manager.connFactory = connFactory
@@ -83,9 +89,13 @@ func (manager *WorkerManager) Finalize() {
 type workerConnAndProcessor struct {
 	conn                      *conn
 	responseProcessingChannel chan<- workFinalizeRequest
+	m                         sync.Mutex
 }
 
-func (wc workerConnAndProcessor) Close() {
+func (wc *workerConnAndProcessor) Close() {
+	// We take a pointer to workerConnAndProcessor because we modify the fields by value (e.g. wc.conn)
+	wc.m.Lock()
+	defer wc.m.Unlock()
 	if wc.conn != nil {
 		wc.conn.nc.Close()
 		wc.conn = nil
@@ -95,13 +105,30 @@ func (wc workerConnAndProcessor) Close() {
 	}
 }
 
-func (wc workerConnAndProcessor) WriteOrClose(bytes []byte) error {
-	_, err := wc.conn.writer.Write(bytes)
-	if err != nil {
-		wc.Close()
-		return err
+func (wc *workerConnAndProcessor) WriteOrClose(bytes []byte) error {
+	// We take a pointer to workerConnAndProcessor because we modify the fields by value (e.g. wc.conn)
+	for {
+		if wc.conn.ShouldClose {
+			wc.Close()
+			return errors.New("Reader failed; closing writer")
+		}
+		// DebugLog("started write")
+		n, err := wc.conn.writer.Write(bytes)
+		// DebugLog("finished write")
+		if err != nil {
+			wc.Close()
+			return err
+		}
+		if n < len(bytes) {
+			if n == 0 {
+				wc.Close()
+				return errors.New("Could not write data")
+			}
+			bytes = bytes[n:]
+			continue
+		}
+		return nil
 	}
-	return nil
 }
 
 func NewWorkerConnAndProcessor(cf ConnectionFactory) (workerConnAndProcessor, error) {
@@ -110,22 +137,24 @@ func NewWorkerConnAndProcessor(cf ConnectionFactory) (workerConnAndProcessor, er
 		return workerConnAndProcessor{}, err
 	}
 	return workerConnAndProcessor{
-		conn: conn,
-		responseProcessingChannel: createResponseProcessorForConnection(conn.reader),
+		conn:                      conn,
+		responseProcessingChannel: createResponseProcessorForConnection(),
 	}, nil
 }
 
 // createResponseProcessorForConnection returns a channel that will process the responses for requests.
 // They are inserted and processed asynchronously, but **in the same order** the requests were sent to memcache.
 // If you open a new connection, you have to open a new response processor, and close the channel for the previous one.
-func createResponseProcessorForConnection(reader *bufio.Reader) chan<- workFinalizeRequest {
+func createResponseProcessorForConnection() chan<- workFinalizeRequest {
 	tasksWithPendingResponsesChan := make(chan workFinalizeRequest, MAX_BACKLOG_PER_WORKER)
 
 	// This goroutine processes the responses, asynchronously
 	go func() {
 		// Process tasks until the channel is closed.
 		for task := range tasksWithPendingResponsesChan {
-			err := task.ResponseCB(reader)
+			// DebugLog("Reading a response from corresponding task.reader")
+			err := task.ResponseCB(task.reader)
+			// DebugLog("Read a response")
 			if err == nil {
 				close(task.errChan)
 				continue
@@ -151,6 +180,12 @@ func createResponseProcessorForConnection(reader *bufio.Reader) chan<- workFinal
 	return tasksWithPendingResponsesChan
 }
 
+var progStart = time.Now()
+
+func DebugLog(message string) {
+	fmt.Printf("%02.6f: %s\n", time.Since(progStart).Seconds(), message)
+}
+
 func workerForConn(workChan <-chan *workRequest, cf ConnectionFactory) {
 	var connAndProcessor workerConnAndProcessor
 	// nullBufReader := bufio.NewReader(nullReader{})
@@ -169,6 +204,7 @@ func workerForConn(workChan <-chan *workRequest, cf ConnectionFactory) {
 			connAndProcessor.responseProcessingChannel <- workFinalizeRequest{
 				errChan:    request.errChan,
 				ResponseCB: request.ResponseCB,
+				reader:     connAndProcessor.conn.reader,
 			}
 		}
 	}
@@ -186,10 +222,12 @@ func workerForConn(workChan <-chan *workRequest, cf ConnectionFactory) {
 
 	for {
 		request, ok := <-workChan
+		// DebugLog("Received request")
 		if !ok {
 			return
 		}
 		if connAndProcessor.conn == nil {
+			// DebugLog("Have a null conn, creating new conn")
 			var err error
 			connAndProcessor, err = NewWorkerConnAndProcessor(cf)
 			if err != nil {
@@ -206,8 +244,10 @@ func workerForConn(workChan <-chan *workRequest, cf ConnectionFactory) {
 		connAndProcessor.conn.extendDeadline()
 		// Non-blocking read for additional request data
 		additionalRequest := nonBlockingReadRequest()
+		// DebugLog("Finished read request")
 
 		if additionalRequest != nil {
+			// DebugLog("Picked up additional requests")
 			// There are 2 or more commands to buffer.
 
 			// Clear and re-use the buffer.
@@ -227,6 +267,7 @@ func workerForConn(workChan <-chan *workRequest, cf ConnectionFactory) {
 			}
 			// fmt.Printf("Batch size = %d\n", len(requests))
 			processRequests(requests, buf)
+			// DebugLog("Done processing additional requests")
 			continue
 		}
 		// fmt.Printf("Batch size = 1\n")
@@ -238,21 +279,19 @@ func workerForConn(workChan <-chan *workRequest, cf ConnectionFactory) {
 			continue
 		}
 
-		// Asyncronously process the response for the request we just sent to memcache.
+		// Asynchronously process the response for the request we just sent to memcache.
 		// By processing this way, we can have MAX_BACKLOG_PER_WORKER requests in flight at the same time per socket.
 		connAndProcessor.responseProcessingChannel <- workFinalizeRequest{
 			errChan:    request.errChan,
 			ResponseCB: request.ResponseCB,
+			reader:     connAndProcessor.conn.reader,
 		}
-	}
-	// No more requests. Close the open connection to avoid a memory leak.
-	if connAndProcessor.conn != nil {
-		connAndProcessor.Close()
+		// DebugLog("Finished processing single request")
 	}
 }
 
 // sendRequestToWorker will send a request to a worker, or stop if no workers are available.
-func (c *WorkerManager) sendRequestToWorker(dataToWrite string, readFn func(*bufio.Reader) error) <-chan error {
+func (c *WorkerManager) sendRequestToWorker(dataToWrite string, readFn func(*BufferedReader) error) <-chan error {
 	errChan := make(chan error, 1)
 	// TODO: This will retry 2 times if we receive the connection error before sending the command.
 	// However, if workChan fills up, this won't retry.
@@ -268,6 +307,7 @@ func (c *WorkerManager) sendRequestToWorker(dataToWrite string, readFn func(*buf
 	 * 3. Goroutines accept from a shared channel? Multiple channels?
 	 * 4. Due to the read timeouts, I think that they'll stop automatically.
 	 */
+	// XXX is this any better?
 	select {
 	case c.workChan <- request:
 		break

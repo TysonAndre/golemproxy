@@ -73,8 +73,6 @@ const (
 	DefaultMaxIdleConns = 2
 )
 
-const buffered = 8 // arbitrary buffered channel size, for readability
-
 // resumableError returns true if err is only a protocol-level cache error.
 // This is used to determine whether or not a server connection should
 // be re-used or not. If an error occurs, by default we don't reuse the
@@ -127,7 +125,7 @@ func New(server string) *Client {
 		addr:       addr,
 		serverRepr: server,
 	}
-	InitWorkerManager(&(client.manager), 3, client)
+	InitWorkerManager(&(client.manager), 10, client)
 	return client
 }
 
@@ -194,32 +192,16 @@ type Item struct {
 // conn is a connection to a server.
 type conn struct {
 	nc     net.Conn
-	reader *bufio.Reader
+	reader *BufferedReader
 	// We don't buffer writer - Instead, we write complete commands and flush.
-	writer io.Writer
-	addr   net.Addr
-	c      *Client
-}
-
-// release returns this connection back to the client's free pool
-func (cn *conn) release() {
-	cn.c.putFreeConn(cn.addr, cn)
+	writer      io.Writer
+	addr        net.Addr
+	c           *Client
+	ShouldClose bool
 }
 
 func (cn *conn) extendDeadline() {
 	cn.nc.SetDeadline(time.Now().Add(cn.c.netTimeout()))
-}
-
-// condRelease releases this connection if the error pointed to by err
-// is nil (not an error) or is only a protocol level error (e.g. a
-// cache miss).  The purpose is to not recycle TCP connections that
-// are bad.
-func (cn *conn) condRelease(err error) {
-	if err == nil || resumableError(err) {
-		cn.release()
-	} else {
-		cn.nc.Close()
-	}
 }
 
 func (c *Client) putFreeConn(addr net.Addr, cn *conn) {
@@ -273,6 +255,16 @@ func (cte *ConnectTimeoutError) Error() string {
 func (c *Client) dial(addr net.Addr) (net.Conn, error) {
 	nc, err := net.DialTimeout(addr.Network(), addr.String(), c.netTimeout())
 	if err == nil {
+		if tcpConn, ok := nc.(*net.TCPConn); ok {
+			err = tcpConn.SetWriteBuffer(100000)
+			if err != nil {
+				fmt.Printf("Failed SetWriteBuffer: %v\n", err)
+			}
+			err = tcpConn.SetReadBuffer(100000)
+			if err != nil {
+				fmt.Printf("Failed SetReadBuffer: %v\n", err)
+			}
+		}
 		return nc, nil
 	}
 
@@ -294,19 +286,28 @@ func (c *Client) getConn() (*conn, error) {
 	if err != nil {
 		return nil, err
 	}
+	// NoDelay is the default
 	cn = &conn{
-		nc:     nc,
-		addr:   addr,
-		reader: bufio.NewReader(nc),
+		nc:   nc,
+		addr: addr,
+		// XXX testing
 		writer: nc, // Not buffered because all users write+flush
 		c:      c,
 	}
-	cn.extendDeadline()
+	cn.reader = &BufferedReader{
+		reader: bufio.NewReader(nc),
+		onClose: func() {
+			// XXX this is a race condition
+			cn.ShouldClose = true
+		},
+	}
 	return cn, nil
 }
 
 func (c *Client) FlushAll() error {
-	return c.flushAll()
+	// FIXME uncomment
+	//return c.flushAll()
+	return nil
 }
 
 // Get gets the item for the given key. ErrCacheMiss is returned for a
@@ -328,21 +329,23 @@ func (c *Client) Touch(key string, seconds int32) (err error) {
 }
 
 // withWorkerFromPool does the same thing as withConnFromPool, but pipelines requests.
-func (c *Client) withWorkerFromPool(dataToWrite string, readFn func(*bufio.Reader) error) (err error) {
+func (c *Client) withWorkerFromPool(dataToWrite string, readFn func(*BufferedReader) error) (err error) {
 	// Returns error or nil
 	return <-c.manager.sendRequestToWorker(dataToWrite, readFn)
 }
 
 func (c *Client) get(keys []string, cb func(*Item)) error {
 	writeCmd := "gets " + strings.Join(keys, " ") + "\r\n"
-	return c.withWorkerFromPool(writeCmd, func(r *bufio.Reader) error {
+	//DebugLog("Called get(keys[])")
+	return c.withWorkerFromPool(writeCmd, func(r *BufferedReader) error {
+		//DebugLog("Calling parseGet")
 		return parseGetResponse(r, cb)
 	})
 }
 
 // flushAll sends the flush_all command to c.addr
 func (c *Client) flushAll() error {
-	return c.withWorkerFromPool("flush_all\r\n", func(r *bufio.Reader) error {
+	return c.withWorkerFromPool("flush_all\r\n", func(r *BufferedReader) error {
 		line, err := r.ReadSlice('\n')
 		if err != nil {
 			return err
@@ -365,7 +368,7 @@ func (c *Client) touch(keys []string, expiration int32) error {
 		}
 	}
 
-	return c.withWorkerFromPool(buf.String(), func(r *bufio.Reader) error {
+	return c.withWorkerFromPool(buf.String(), func(r *BufferedReader) error {
 		// Process results in same order as written
 		var err error
 		for range keys {
@@ -401,15 +404,28 @@ func (c *Client) GetMulti(keys []string) (map[string]*Item, error) {
 	return m, err
 }
 
+func (c *Client) GetMultiArray(keys []string) ([]*Item, error) {
+	// TODO: Will this be thread safe when there are multiple servers?
+	result := make([]*Item, 0, len(keys))
+	err := c.get(keys, func(it *Item) {
+		result = append(result, it)
+	})
+	return result, err
+}
+
 // parseGetResponse reads a GET response from r and calls cb for each
 // read and allocated Item
-func parseGetResponse(r *bufio.Reader, cb func(*Item)) error {
+func parseGetResponse(r *BufferedReader, cb func(*Item)) error {
 	for {
+		//DebugLog(fmt.Sprintf("Start readSlice"))
 		line, err := r.ReadSlice('\n')
 		if err != nil {
+			//DebugLog(fmt.Sprintf("Fail readSlice: %v", err))
 			return err
 		}
+		//DebugLog(fmt.Sprintf("Done readSlice: %v", line))
 		if bytes.Equal(line, resultEnd) {
+			//DebugLog(fmt.Sprintf("Done readSlice, returning: %s", line))
 			return nil
 		}
 		it := new(Item)
@@ -568,6 +584,7 @@ func (c *Client) populateOne(verb string, item *Item) error {
 		return ErrMalformedKey
 	}
 	var writeString string
+	// FIXME need to support non-utf8 for PHP
 	if verb == "cas" {
 		writeString = fmt.Sprintf("%s %s %d %d %d %d\r\n%s\r\n",
 			verb, item.Key, item.Flags, item.Expiration, len(item.Value), item.casid, item.Value)
@@ -575,7 +592,7 @@ func (c *Client) populateOne(verb string, item *Item) error {
 		writeString = fmt.Sprintf("%s %s %d %d %d\r\n%s\r\n",
 			verb, item.Key, item.Flags, item.Expiration, len(item.Value), item.Value)
 	}
-	return c.withWorkerFromPool(writeString, func(r *bufio.Reader) error {
+	return c.withWorkerFromPool(writeString, func(r *BufferedReader) error {
 		line, err := r.ReadSlice('\n')
 		if err != nil {
 			return err
@@ -594,17 +611,7 @@ func (c *Client) populateOne(verb string, item *Item) error {
 	})
 }
 
-func writeReadLine(reader *bufio.Reader, writer io.Writer, format string, args ...interface{}) ([]byte, error) {
-	// The Fprintf implementation calls Write exactly once.
-	_, err := fmt.Fprintf(writer, format, args...)
-	if err != nil {
-		return nil, err
-	}
-	line, err := reader.ReadSlice('\n')
-	return line, err
-}
-
-func readLineAndExpect(reader *bufio.Reader, expect []byte) error {
+func readLineAndExpect(reader *BufferedReader, expect []byte) error {
 	line, err := reader.ReadSlice('\n')
 	if err != nil {
 		return err
@@ -627,14 +634,14 @@ func readLineAndExpect(reader *bufio.Reader, expect []byte) error {
 // Delete deletes the item with the provided key. The error ErrCacheMiss is
 // returned if the item didn't already exist in the cache.
 func (c *Client) Delete(key string) error {
-	return c.withWorkerFromPool("delete "+key+"\r\n", func(r *bufio.Reader) error {
+	return c.withWorkerFromPool("delete "+key+"\r\n", func(r *BufferedReader) error {
 		return readLineAndExpect(r, resultDeleted)
 	})
 }
 
 // DeleteAll deletes all items in the cache.
 func (c *Client) DeleteAll() error {
-	return c.withWorkerFromPool("flush_all\r\n", func(r *bufio.Reader) error {
+	return c.withWorkerFromPool("flush_all\r\n", func(r *BufferedReader) error {
 		return readLineAndExpect(r, resultDeleted)
 	})
 }
@@ -661,7 +668,7 @@ func (c *Client) Decrement(key string, delta uint64) (newValue uint64, err error
 func (c *Client) incrDecr(verb, key string, delta uint64) (uint64, error) {
 	var val uint64
 	writeString := fmt.Sprintf("%s %s %d\r\n", verb, key, delta)
-	err := c.withWorkerFromPool(writeString, func(r *bufio.Reader) error {
+	err := c.withWorkerFromPool(writeString, func(r *BufferedReader) error {
 		line, err := r.ReadSlice('\n')
 		if err != nil {
 			return err
@@ -674,10 +681,7 @@ func (c *Client) incrDecr(verb, key string, delta uint64) (uint64, error) {
 			return errors.New("memcache: client error: " + string(errMsg))
 		}
 		val, err = strconv.ParseUint(string(line[:len(line)-2]), 10, 64)
-		if err != nil {
-			return err
-		}
-		return nil
+		return err
 	})
 	return val, err
 }
