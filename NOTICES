@@ -1,0 +1,11 @@
+See LICENSE
+
+---
+
+memcache/sharded/ketama.go:
+
+This implementation draws from the Daisuke Maki's Perl module, which itself is
+based on the original libketama code.  That code was licensed under the GPLv2,
+and thus so is this file.
+
+This was modified to be compatible with twemproxy instead of the perl module.
