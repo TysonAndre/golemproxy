@@ -1,5 +1,5 @@
 // This package listens on a socket and forwards data to one or more memcache servers
-package main
+package server
 
 import (
 	"bufio"

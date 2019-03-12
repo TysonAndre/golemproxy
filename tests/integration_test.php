@@ -4,7 +4,7 @@
 // verifies that this is able to respond to requests from a php client library
 
 $cache = new Memcached();
-$cache->addServer('/tmp/golemproxy.sock', 0);
+$cache->addServer('/var/tmp/golemproxy.0', 0);
 $cache->setOptions([
     Memcached::OPT_SEND_TIMEOUT => 1000000,
     Memcached::OPT_RECV_TIMEOUT => 1000000,

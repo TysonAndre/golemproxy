@@ -15,9 +15,3 @@ This is not usable yet.
 ### Using *go get*
 
     $ go get github.com/TysonAndre/golemproxy
-
-See https://godoc.org/github.com/TysonAndre/golemproxy
-
-Or run:
-
-    $ godoc github.com/TysonAndre/golemproxy

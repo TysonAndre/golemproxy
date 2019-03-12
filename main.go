@@ -1,10 +1,13 @@
+// package main is the entry point for the memcache proxy golemproxy
+package main
+
 /**
  * Copyright 2018 Tyson Andre
  */
-package main
 
 import (
 	"github.com/TysonAndre/golemproxy/config"
+	"github.com/TysonAndre/golemproxy/server"
 
 	"flag"
 	"fmt"
@@ -26,5 +29,5 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Invalid config file %q: %v", configFile, err)
 	}
 	fmt.Fprintf(os.Stderr, "Starting: %#v\n", configs)
-	_ = configs
+	server.Run(configs)
 }
