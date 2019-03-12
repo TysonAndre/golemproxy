@@ -17,6 +17,7 @@ import (
 
 	"github.com/TysonAndre/golemproxy/config"
 	"github.com/TysonAndre/golemproxy/memcache"
+	"github.com/TysonAndre/golemproxy/memcache/sharded"
 	"go4.org/strutil"
 )
 
@@ -256,7 +257,7 @@ func Run(configs map[string]config.Config) {
 	listeners := []net.Listener{}
 
 	for _, config := range configs {
-		remote := memcache.New("127.0.0.1:11211")
+		remote := sharded.New(config)
 		socketPath := config.Listen
 		l, err := createUnixSocket(socketPath)
 		if err != nil {
