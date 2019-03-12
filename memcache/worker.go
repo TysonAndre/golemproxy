@@ -28,7 +28,7 @@ type ConnectionFactory interface {
 	getConn() (*conn, error)
 }
 
-var _ ConnectionFactory = &Client{}
+var _ ConnectionFactory = &PipeliningClient{}
 
 type WorkerManager struct {
 	maxWorkers         int

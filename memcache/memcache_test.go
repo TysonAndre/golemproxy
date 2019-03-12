@@ -82,7 +82,7 @@ func TestUnixSocket(t *testing.T) {
 	testWithClient(t, c)
 }
 
-func mustSetF(t *testing.T, c *Client) func(*Item) {
+func mustSetF(t *testing.T, c ClientInterface) func(*Item) {
 	return func(it *Item) {
 		if err := c.Set(it); err != nil {
 			t.Fatalf("failed to Set %#v: %v", *it, err)
@@ -95,7 +95,7 @@ func debugPrintf(format string, args ...interface{}) {
 	// fmt.Printf(format, args...)
 }
 
-func testWithClient(t *testing.T, c *Client) {
+func testWithClient(t *testing.T, c ClientInterface) {
 	checkErr := func(err error, format string, args ...interface{}) {
 		if err != nil {
 			t.Fatalf(format, args...)
@@ -237,7 +237,7 @@ func testWithClient(t *testing.T, c *Client) {
 
 }
 
-func testTouchWithClient(t *testing.T, c *Client) {
+func testTouchWithClient(t *testing.T, c ClientInterface) {
 	if testing.Short() {
 		t.Log("Skipping testing memcache Touch with testing in Short mode")
 		return

@@ -1,4 +1,12 @@
 /*
+
+Copyright 2019 Tyson Andre
+
+---
+
+Based on https://github.com/bradfitz/gomemcache/blob/master/memcache/memcache.go
+with many modifications
+
 Copyright 2011 Google Inc.
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -115,13 +123,13 @@ var (
 )
 
 // New returns a memcache client using the provided server.
-func New(server string) *Client {
+func New(server string) *PipeliningClient {
 	addr, err := ResolveServerAddr(server)
 	if err != nil {
 		panic(fmt.Sprintf("Failed to resolve %s", server))
 	}
 
-	client := &Client{
+	client := &PipeliningClient{
 		addr:       addr,
 		serverRepr: server,
 	}
@@ -130,7 +138,7 @@ func New(server string) *Client {
 }
 
 // Finalize is called in unit tests to free up open connections.
-func (c *Client) Finalize() {
+func (c *PipeliningClient) Finalize() {
 	c.manager.Finalize()
 	c.lk.Lock()
 	defer c.lk.Unlock()
@@ -140,9 +148,23 @@ func (c *Client) Finalize() {
 	c.freelist = nil
 }
 
-// Client is a memcache client.
+type ClientInterface interface {
+	Get(key string) (item *Item, err error)
+	GetMulti(keys []string) (map[string]*Item, error)
+	GetMultiArray(keys []string) ([]*Item, error)
+	Set(item *Item) error
+	Add(item *Item) error
+	Replace(item *Item) error
+	Increment(key string, delta uint64) (newValue uint64, err error)
+	Decrement(key string, delta uint64) (newValue uint64, err error)
+	Delete(key string) error
+	DeleteAll() error
+	Touch(key string, seconds int32) error
+}
+
+// PipeliningClient is a memcache client with pipelining.
 // It is safe for unlocked use by multiple concurrent goroutines.
-type Client struct {
+type PipeliningClient struct {
 	// Timeout specifies the socket read/write timeout.
 	// If zero, DefaultTimeout is used.
 	Timeout time.Duration
@@ -167,6 +189,8 @@ type Client struct {
 	lk       sync.Mutex
 	freelist []*conn
 }
+
+var _ ClientInterface = &PipeliningClient{}
 
 // Item is an item to be got or stored in a memcached server.
 type Item struct {
@@ -196,7 +220,7 @@ type conn struct {
 	// We don't buffer writer - Instead, we write complete commands and flush.
 	writer      io.Writer
 	addr        net.Addr
-	c           *Client
+	c           *PipeliningClient
 	ShouldClose bool
 }
 
@@ -204,7 +228,7 @@ func (cn *conn) extendDeadline() {
 	cn.nc.SetDeadline(time.Now().Add(cn.c.netTimeout()))
 }
 
-func (c *Client) putFreeConn(addr net.Addr, cn *conn) {
+func (c *PipeliningClient) putFreeConn(addr net.Addr, cn *conn) {
 	c.lk.Lock()
 	defer c.lk.Unlock()
 	freelist := c.freelist
@@ -215,7 +239,7 @@ func (c *Client) putFreeConn(addr net.Addr, cn *conn) {
 	c.freelist = append(freelist, cn)
 }
 
-func (c *Client) getFreeConn(addr net.Addr) (cn *conn, ok bool) {
+func (c *PipeliningClient) getFreeConn(addr net.Addr) (cn *conn, ok bool) {
 	c.lk.Lock()
 	defer c.lk.Unlock()
 	freelist := c.freelist
@@ -227,14 +251,14 @@ func (c *Client) getFreeConn(addr net.Addr) (cn *conn, ok bool) {
 	return cn, true
 }
 
-func (c *Client) netTimeout() time.Duration {
+func (c *PipeliningClient) netTimeout() time.Duration {
 	if c.Timeout != 0 {
 		return c.Timeout
 	}
 	return DefaultTimeout
 }
 
-func (c *Client) maxIdleConns() int {
+func (c *PipeliningClient) maxIdleConns() int {
 	if c.MaxIdleConns > 0 {
 		return c.MaxIdleConns
 	}
@@ -252,7 +276,7 @@ func (cte *ConnectTimeoutError) Error() string {
 	return "memcache: connect timeout to " + cte.Addr.String()
 }
 
-func (c *Client) dial(addr net.Addr) (net.Conn, error) {
+func (c *PipeliningClient) dial(addr net.Addr) (net.Conn, error) {
 	nc, err := net.DialTimeout(addr.Network(), addr.String(), c.netTimeout())
 	if err == nil {
 		if tcpConn, ok := nc.(*net.TCPConn); ok {
@@ -275,7 +299,7 @@ func (c *Client) dial(addr net.Addr) (net.Conn, error) {
 	return nil, err
 }
 
-func (c *Client) getConn() (*conn, error) {
+func (c *PipeliningClient) getConn() (*conn, error) {
 	addr := c.addr
 	cn, ok := c.getFreeConn(addr)
 	if ok {
@@ -304,7 +328,7 @@ func (c *Client) getConn() (*conn, error) {
 	return cn, nil
 }
 
-func (c *Client) FlushAll() error {
+func (c *PipeliningClient) FlushAll() error {
 	// FIXME uncomment
 	//return c.flushAll()
 	return nil
@@ -312,7 +336,7 @@ func (c *Client) FlushAll() error {
 
 // Get gets the item for the given key. ErrCacheMiss is returned for a
 // memcache cache miss. The key must be at most 250 bytes in length.
-func (c *Client) Get(key string) (item *Item, err error) {
+func (c *PipeliningClient) Get(key string) (item *Item, err error) {
 	err = c.get([]string{key}, func(it *Item) { item = it })
 	if err == nil && item == nil {
 		err = ErrCacheMiss
@@ -324,17 +348,17 @@ func (c *Client) Get(key string) (item *Item, err error) {
 // a Unix timestamp or, if seconds is less than 1 month, the number of seconds
 // into the future at which time the item will expire. ErrCacheMiss is returned if the
 // key is not in the cache. The key must be at most 250 bytes in length.
-func (c *Client) Touch(key string, seconds int32) (err error) {
+func (c *PipeliningClient) Touch(key string, seconds int32) (err error) {
 	return c.touch([]string{key}, seconds)
 }
 
 // withWorkerFromPool does the same thing as withConnFromPool, but pipelines requests.
-func (c *Client) withWorkerFromPool(dataToWrite string, readFn func(*BufferedReader) error) (err error) {
+func (c *PipeliningClient) withWorkerFromPool(dataToWrite string, readFn func(*BufferedReader) error) (err error) {
 	// Returns error or nil
 	return <-c.manager.sendRequestToWorker(dataToWrite, readFn)
 }
 
-func (c *Client) get(keys []string, cb func(*Item)) error {
+func (c *PipeliningClient) get(keys []string, cb func(*Item)) error {
 	writeCmd := "gets " + strings.Join(keys, " ") + "\r\n"
 	//DebugLog("Called get(keys[])")
 	return c.withWorkerFromPool(writeCmd, func(r *BufferedReader) error {
@@ -344,7 +368,7 @@ func (c *Client) get(keys []string, cb func(*Item)) error {
 }
 
 // flushAll sends the flush_all command to c.addr
-func (c *Client) flushAll() error {
+func (c *PipeliningClient) flushAll() error {
 	return c.withWorkerFromPool("flush_all\r\n", func(r *BufferedReader) error {
 		line, err := r.ReadSlice('\n')
 		if err != nil {
@@ -360,7 +384,7 @@ func (c *Client) flushAll() error {
 	})
 }
 
-func (c *Client) touch(keys []string, expiration int32) error {
+func (c *PipeliningClient) touch(keys []string, expiration int32) error {
 	buf := bytes.NewBuffer(nil)
 	for _, key := range keys {
 		if _, err := fmt.Fprintf(buf, "touch %s %d\r\n", key, expiration); err != nil {
@@ -395,7 +419,7 @@ func (c *Client) touch(keys []string, expiration int32) error {
 // items may have fewer elements than the input slice, due to memcache
 // cache misses. Each key must be at most 250 bytes in length.
 // If no error is returned, the returned map will also be non-nil.
-func (c *Client) GetMulti(keys []string) (map[string]*Item, error) {
+func (c *PipeliningClient) GetMulti(keys []string) (map[string]*Item, error) {
 	m := make(map[string]*Item)
 	// This is single threaded, has no race conditions.
 	err := c.get(keys, func(it *Item) {
@@ -404,7 +428,7 @@ func (c *Client) GetMulti(keys []string) (map[string]*Item, error) {
 	return m, err
 }
 
-func (c *Client) GetMultiArray(keys []string) ([]*Item, error) {
+func (c *PipeliningClient) GetMultiArray(keys []string) ([]*Item, error) {
 	// TODO: Will this be thread safe when there are multiple servers?
 	result := make([]*Item, 0, len(keys))
 	err := c.get(keys, func(it *Item) {
@@ -552,19 +576,19 @@ func scanGetResponseLine(line []byte, it *Item) (size int, err error) {
 */
 
 // Set writes the given item, unconditionally.
-func (c *Client) Set(item *Item) error {
+func (c *PipeliningClient) Set(item *Item) error {
 	return c.populateOne("set", item)
 }
 
 // Add writes the given item, if no value already exists for its
 // key. ErrNotStored is returned if that condition is not met.
-func (c *Client) Add(item *Item) error {
+func (c *PipeliningClient) Add(item *Item) error {
 	return c.populateOne("add", item)
 }
 
 // Replace writes the given item, but only if the server *does*
 // already hold data for this key
-func (c *Client) Replace(item *Item) error {
+func (c *PipeliningClient) Replace(item *Item) error {
 	return c.populateOne("replace", item)
 }
 
@@ -575,11 +599,11 @@ func (c *Client) Replace(item *Item) error {
 // is returned if the value was modified in between the
 // calls. ErrNotStored is returned if the value was evicted in between
 // the calls.
-func (c *Client) CompareAndSwap(item *Item) error {
+func (c *PipeliningClient) CompareAndSwap(item *Item) error {
 	return c.populateOne("cas", item)
 }
 
-func (c *Client) populateOne(verb string, item *Item) error {
+func (c *PipeliningClient) populateOne(verb string, item *Item) error {
 	if !legalKey(item.Key) {
 		return ErrMalformedKey
 	}
@@ -633,14 +657,14 @@ func readLineAndExpect(reader *BufferedReader, expect []byte) error {
 
 // Delete deletes the item with the provided key. The error ErrCacheMiss is
 // returned if the item didn't already exist in the cache.
-func (c *Client) Delete(key string) error {
+func (c *PipeliningClient) Delete(key string) error {
 	return c.withWorkerFromPool("delete "+key+"\r\n", func(r *BufferedReader) error {
 		return readLineAndExpect(r, resultDeleted)
 	})
 }
 
 // DeleteAll deletes all items in the cache.
-func (c *Client) DeleteAll() error {
+func (c *PipeliningClient) DeleteAll() error {
 	return c.withWorkerFromPool("flush_all\r\n", func(r *BufferedReader) error {
 		return readLineAndExpect(r, resultDeleted)
 	})
@@ -651,7 +675,7 @@ func (c *Client) DeleteAll() error {
 // didn't exist in memcached the error is ErrCacheMiss. The value in
 // memcached must be an decimal number, or an error will be returned.
 // On 64-bit overflow, the new value wraps around.
-func (c *Client) Increment(key string, delta uint64) (newValue uint64, err error) {
+func (c *PipeliningClient) Increment(key string, delta uint64) (newValue uint64, err error) {
 	return c.incrDecr("incr", key, delta)
 }
 
@@ -661,11 +685,11 @@ func (c *Client) Increment(key string, delta uint64) (newValue uint64, err error
 // memcached must be an decimal number, or an error will be returned.
 // On underflow, the new value is capped at zero and does not wrap
 // around.
-func (c *Client) Decrement(key string, delta uint64) (newValue uint64, err error) {
+func (c *PipeliningClient) Decrement(key string, delta uint64) (newValue uint64, err error) {
 	return c.incrDecr("decr", key, delta)
 }
 
-func (c *Client) incrDecr(verb, key string, delta uint64) (uint64, error) {
+func (c *PipeliningClient) incrDecr(verb, key string, delta uint64) (uint64, error) {
 	var val uint64
 	writeString := fmt.Sprintf("%s %s %d\r\n", verb, key, delta)
 	err := c.withWorkerFromPool(writeString, func(r *BufferedReader) error {
@@ -687,6 +711,6 @@ func (c *Client) incrDecr(verb, key string, delta uint64) (uint64, error) {
 }
 
 // GetServer returns the address of the server originally passed to memcache.New().
-func (c *Client) GetServer() string {
+func (c *PipeliningClient) GetServer() string {
 	return c.serverRepr
 }

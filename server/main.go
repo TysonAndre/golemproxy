@@ -17,6 +17,7 @@ import (
 
 	"github.com/TysonAndre/golemproxy/config"
 	"github.com/TysonAndre/golemproxy/memcache"
+	"go4.org/strutil"
 )
 
 var (
@@ -80,7 +81,7 @@ func makeResponsePayloadFromItems(items []*memcache.Item) []byte {
 }
 
 // handleGet forwards the GET request to a memcache client and sends a response back
-func handleGet(reader *bufio.Reader, writer io.Writer, remote *memcache.Client) error {
+func handleGet(reader *bufio.Reader, writer io.Writer, remote memcache.ClientInterface) error {
 	rawkeys, err := reader.ReadSlice('\n')
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to read rest: rawkeys=%s err=%v", rawkeys, err)
@@ -91,7 +92,6 @@ func handleGet(reader *bufio.Reader, writer io.Writer, remote *memcache.Client) 
 		return errors.New("failed to read keys")
 	}
 	keys := extractKeys(rawkeys[:len(rawkeys)-2])
-	// TODO: implement
 	items, err := remote.GetMultiArray(keys)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Fetching failed: %v\n", err)
@@ -105,25 +105,9 @@ func handleGet(reader *bufio.Reader, writer io.Writer, remote *memcache.Client) 
 	return nil
 }
 
-// atoi converts a sequence of 0-9 to the integer it represents
-func atoi(x []byte) (uint32, error) {
-	result := uint32(0)
-	if len(x) == 0 {
-		return 0, errors.New("missing number")
-	}
-	for _, b := range x {
-		if b < '0' || b > '9' {
-			return 0, fmt.Errorf("out of range: %v", x)
-		}
-		// could check overflow
-		result = result*10 + uint32(b-'0')
-	}
-	return result, nil
-}
-
 // handleSet forwards a set request to the memcache servers and returns a result.
 // TODO: Add the capability to mock successful responses before sending the request
-func handleSet(reader *bufio.Reader, writer io.Writer, remote *memcache.Client) error {
+func handleSet(reader *bufio.Reader, writer io.Writer, remote memcache.ClientInterface) error {
 	// parse the number of bytes then read
 	line, err := reader.ReadSlice('\n')
 	if err != nil {
@@ -136,15 +120,15 @@ func handleSet(reader *bufio.Reader, writer io.Writer, remote *memcache.Client) 
 	key := string(parts[0])
 
 	// TODO: use https://godoc.org/go4.org/strutil#ParseUintBytes
-	flags, err := atoi(parts[1])
+	flags, err := strutil.ParseUintBytes(parts[1], 10, 32)
 	if err != nil {
 		return fmt.Errorf("failed to parse flags: %v", err)
 	}
-	expiry, err := atoi(parts[2])
+	expiry, err := strutil.ParseUintBytes(parts[2], 10, 32)
 	if err != nil {
 		return fmt.Errorf("failed to parse expiry: %v", err)
 	}
-	length, err := atoi(parts[3])
+	length, err := strutil.ParseUintBytes(parts[3], 10, 30)
 	if err != nil {
 		return fmt.Errorf("failed to parse length: %v", err)
 	}
@@ -164,7 +148,7 @@ func handleSet(reader *bufio.Reader, writer io.Writer, remote *memcache.Client) 
 
 	item := &memcache.Item{
 		Key:        key,
-		Flags:      flags,
+		Flags:      uint32(flags),
 		Expiration: int32(expiry),
 		Value:      bytes,
 	}
@@ -182,7 +166,7 @@ func handleSet(reader *bufio.Reader, writer io.Writer, remote *memcache.Client) 
 	return nil
 }
 
-func handleCommand(reader *bufio.Reader, writer io.Writer, remote *memcache.Client) error {
+func handleCommand(reader *bufio.Reader, writer io.Writer, remote memcache.ClientInterface) error {
 	cmd, err := reader.ReadSlice(' ')
 	if err != nil {
 		// Check if the reader exited cleanly
@@ -213,7 +197,7 @@ func handleCommand(reader *bufio.Reader, writer io.Writer, remote *memcache.Clie
 }
 
 // serveSocket runs in a loop to read memcached requests and send memcached responses
-func serveSocket(remote *memcache.Client, c net.Conn) {
+func serveSocket(remote memcache.ClientInterface, c net.Conn) {
 	reader := bufio.NewReader(c)
 
 	for {
@@ -248,7 +232,7 @@ func createUnixSocket(path string) (net.Listener, error) {
 	return l, err
 }
 
-func serveSocketServer(remote *memcache.Client, l net.Listener, path string, didExit *bool) {
+func serveSocketServer(remote memcache.ClientInterface, l net.Listener, path string, didExit *bool) {
 	for {
 		fd, err := l.Accept()
 		if *didExit {
@@ -270,9 +254,9 @@ func Run(configs map[string]config.Config) {
 
 	didExit := false
 	listeners := []net.Listener{}
-	remote := memcache.New("127.0.0.1:11211")
 
 	for _, config := range configs {
+		remote := memcache.New("127.0.0.1:11211")
 		socketPath := config.Listen
 		l, err := createUnixSocket(socketPath)
 		if err != nil {
