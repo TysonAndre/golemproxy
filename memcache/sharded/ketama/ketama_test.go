@@ -8,24 +8,34 @@ import (
 	"testing"
 )
 
+// FIXME: Finish writing this test and fixing the ketama implementation.
+// This asserts that an array of random integers get hashed to the expected bucket by asserting that the count of uint32s mapped to the bucket
+// is the same as the count for the ketama implementation this aims to be compatible with.
+
 func TestBasicCompat(t *testing.T) {
-	var compatTest = []Bucket{
-		{"server1", 8672},
-		{"server10", 9595},
-		{"server2", 10825},
-		{"server3", 10057},
-		{"server4", 10238},
-		{"server5", 9079},
-		{"server6", 11149},
-		{"server7", 10211},
-		{"server8", 10251},
-		{"server9", 9923},
+	type Pair struct {
+		Server        string
+		ExpectedCount int
+	}
+	// TODO: Verify that the result is the same as what twemproxy's algorithm would return.
+	var compatTest = []Pair{
+		Pair{"server1", 8672},
+		Pair{"server10", 9595},
+		Pair{"server2", 10825},
+		Pair{"server3", 10057},
+		Pair{"server4", 10238},
+		Pair{"server5", 9079},
+		Pair{"server6", 11149},
+		Pair{"server7", 10211},
+		Pair{"server8", 10251},
+		Pair{"server9", 9923},
 	}
 
 	var buckets []Bucket
 
 	for i := 1; i <= 10; i++ {
-		b := &Bucket{Label: fmt.Sprintf("server%d", i), Weight: 1}
+		label := fmt.Sprintf("server%d", i)
+		b := &Bucket{Label: label, Weight: 1, Data: label}
 		buckets = append(buckets, *b)
 	}
 
@@ -33,14 +43,16 @@ func TestBasicCompat(t *testing.T) {
 
 	m := make(map[string]int)
 
-	for i := 0; i < 100000; i++ {
-		s := k.Hash(uint32(i) * uint32(3156322237))
+	for i := uint32(0); i < 100000; i++ {
+		s := k.Get(i * uint32(3156322237)).(string)
 		m[s]++
 	}
 
 	for _, tt := range compatTest {
-		if m[tt.Label] != tt.Weight {
-			t.Errorf("basic compatibility check failed key=%s expected=%d got=%d", tt.Label, tt.Weight, m[tt.Label])
+		server := tt.Server
+		actualCount := m[tt.Server]
+		if actualCount != tt.ExpectedCount {
+			t.Errorf("basic compatibility check failed key=%s expected=%d got=%d", server, tt.ExpectedCount, actualCount)
 		}
 	}
 }
