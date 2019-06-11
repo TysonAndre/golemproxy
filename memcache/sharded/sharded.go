@@ -3,9 +3,10 @@ package sharded
 
 import (
 	"errors"
+	"os"
+
 	"github.com/TysonAndre/golemproxy/config"
 	"github.com/TysonAndre/golemproxy/memcache"
-	"os"
 
 	"fmt"
 	"sync"
@@ -108,6 +109,24 @@ func (c *ShardedClient) Increment(key string, delta uint64) (newValue uint64, er
 
 func (c *ShardedClient) Decrement(key string, delta uint64) (newValue uint64, err error) {
 	return c.getClient(key).Decrement(key, delta)
+}
+
+func (c *ShardedClient) Finalize() {
+	clients := c.clients
+	if len(clients) == 0 {
+		return
+	}
+	c.clients = nil
+
+	var wg sync.WaitGroup
+	wg.Add(len(clients))
+	for _, server := range c.clients {
+		go func() {
+			server.Finalize()
+			wg.Done()
+		}()
+	}
+	wg.Wait()
 }
 
 func New(conf config.Config) memcache.ClientInterface {

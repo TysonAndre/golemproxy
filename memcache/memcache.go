@@ -159,6 +159,7 @@ type ClientInterface interface {
 	Delete(key string) error
 	DeleteAll() error
 	Touch(key string, seconds int32) error
+	Finalize()
 }
 
 // PipeliningClient is a memcache client with pipelining.
@@ -610,7 +611,7 @@ func (c *PipeliningClient) populateOne(verb string, item *Item) error {
 		return ErrMalformedKey
 	}
 	var writeString string
-	// FIXME need to support non-utf8 for PHP
+	// FIXME need to support non-utf8 for clients such as PHP+igbinary
 	if verb == "cas" {
 		writeString = fmt.Sprintf("%s %s %d %d %d %d\r\n%s\r\n",
 			verb, item.Key, item.Flags, item.Expiration, len(item.Value), item.casid, item.Value)
