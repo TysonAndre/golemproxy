@@ -68,7 +68,7 @@ var (
 	ErrMalformedKey = errors.New("malformed: key is too long or contains invalid characters")
 
 	// ErrNoServers is returned when no servers are configured or available.
-	ErrNoServers = errors.New("memcache: no servers configured or available")
+	// ErrNoServers = errors.New("memcache: no servers configured or available")
 )
 
 const (
