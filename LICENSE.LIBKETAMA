@@ -1,0 +1,8 @@
+The implementation of memcache/sharded/ketama/ketama.go draws from the Daisuke Maki's Perl module, which itself is
+based on the original libketama code.  That code was licensed under the GPLv2,
+and thus so is https://github.com/dgryski/go-ketama/blob/master/ketama.go
+
+The major API change from libketama is that Algorithm::ConsistentHash::Ketama allows hashing
+arbitrary strings, instead of just memcached server IP addresses.
+
+Original source: https://github.com/dgryski/go-ketama/blob/master/ketama.go
