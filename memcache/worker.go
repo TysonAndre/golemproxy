@@ -40,7 +40,7 @@ type WorkerManager struct {
 type workRequest struct {
 	// Serialization of the non-empty command to send to memcache
 	// (e.g. to send a memcached Get request asynchronously)
-	DataToWrite string
+	DataToWrite []byte
 	// A callback which synchronously reads a non-zero number of bytes from r
 	// (e.g. to process the result of a memcached Get request made earlier by the worker.)
 	ResponseCB func(r *BufferedReader) error
@@ -68,10 +68,10 @@ type workFinalizeRequest struct {
 
 func InitWorkerManager(manager *WorkerManager, maxWorkers int, connFactory ConnectionFactory) {
 	// FIXME support multiple workers
-	if maxWorkers < 3 {
-		maxWorkers = 3
+	if maxWorkers < 1 {
+		maxWorkers = 1
 	}
-	maxWorkers = 1
+	// XXX the maxWorkers setting is ignored, in practice this isn't useful
 	manager.createdWorkerCount = 0
 	manager.workChan = make(chan *workRequest, MAX_BACKLOG_SIZE)
 	manager.connFactory = connFactory
@@ -291,7 +291,7 @@ func workerForConn(workChan <-chan *workRequest, cf ConnectionFactory) {
 }
 
 // sendRequestToWorker will send a request to a worker, or stop if no workers are available.
-func (c *WorkerManager) sendRequestToWorker(dataToWrite string, readFn func(*BufferedReader) error) <-chan error {
+func (c *WorkerManager) sendRequestToWorker(dataToWrite []byte, readFn func(*BufferedReader) error) <-chan error {
 	errChan := make(chan error, 1)
 	// TODO: This will retry 2 times if we receive the connection error before sending the command.
 	// However, if workChan fills up, this won't retry.

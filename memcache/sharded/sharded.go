@@ -3,10 +3,10 @@ package sharded
 
 import (
 	"errors"
-	"os"
 
 	"github.com/TysonAndre/golemproxy/config"
 	"github.com/TysonAndre/golemproxy/memcache"
+	"github.com/TysonAndre/golemproxy/memcache/proxy/message"
 
 	"fmt"
 	"sync"
@@ -18,6 +18,11 @@ type ShardedClient struct {
 }
 
 var _ memcache.ClientInterface = &ShardedClient{}
+
+func (c *ShardedClient) SendProxiedMessageAsync(command *message.SingleMessage) {
+	// TODO: optimize out the string copy
+	c.getClient(string(command.Key)).SendProxiedMessageAsync(command)
+}
 
 func (c *ShardedClient) Get(key string) (item *memcache.Item, err error) {
 	return c.getClient(key).Get(key)
@@ -143,13 +148,13 @@ func New(conf config.Config) memcache.ClientInterface {
 	if len(clients) == 1 {
 		return clients[0]
 	}
-	var hasher = createHasher(conf.Hash)
+	// var hasher = createHasher(conf.Hash)
 
 	return &ShardedClient{
 		getClient: func(key string) *memcache.PipeliningClient {
 			// FIXME: implement or reuse hash ring algorithm
-			hash := hasher(key)
-			fmt.Fprintf(os.Stderr, "Hash of %q is %d", key, hash)
+			// hash := hasher(key)
+			// fmt.Fprintf(os.Stderr, "Hash of %q is %d\n", key, hash)
 			return clients[0]
 		},
 		clients: clients,

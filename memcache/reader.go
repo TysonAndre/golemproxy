@@ -13,12 +13,12 @@ type BufferedReader struct {
 
 var ErrPreviousRequestFailed = errors.New("A previous request failed")
 
-// ReadSlice returns a slice that lasts until the next read from the buffer
-func (reader *BufferedReader) ReadSlice(delim byte) ([]byte, error) {
+// ReadBytes returns a copy of bytes that lasts until the next read from the buffer
+func (reader *BufferedReader) ReadBytes(delim byte) ([]byte, error) {
 	if reader.failed == true {
 		return nil, ErrPreviousRequestFailed
 	}
-	result, err := reader.reader.ReadSlice(delim)
+	result, err := reader.reader.ReadBytes(delim)
 	if err != nil {
 		reader.handleError()
 	}

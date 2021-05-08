@@ -1,6 +1,6 @@
 /*
 
-Copyright 2019 Tyson Andre
+Copyright 2021 Tyson Andre
 
 ---
 
@@ -32,11 +32,14 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/TysonAndre/golemproxy/memcache/proxy/message"
 )
 
 // Similar to:
@@ -117,8 +120,7 @@ var (
 	resultTouched   = []byte("TOUCHED\r\n")
 
 	resultClientErrorPrefix = []byte("CLIENT_ERROR ")
-
-	valuePrefix = []byte("VALUE ")
+	resultValuePrefix       = []byte("VALUE ")
 )
 
 // New returns a memcache client using the provided server.
@@ -132,7 +134,7 @@ func New(server string) *PipeliningClient {
 		addr:       addr,
 		serverRepr: server,
 	}
-	InitWorkerManager(&(client.manager), 10, client)
+	InitWorkerManager(&(client.manager), 3, client)
 	return client
 }
 
@@ -148,6 +150,9 @@ func (c *PipeliningClient) Finalize() {
 }
 
 type ClientInterface interface {
+	// TODO generalize
+	SendProxiedMessageAsync(command *message.SingleMessage)
+
 	Get(key string) (item *Item, err error)
 	GetMulti(keys []string) (map[string]*Item, error)
 	GetMultiArray(keys []string) ([]*Item, error)
@@ -353,13 +358,144 @@ func (c *PipeliningClient) Touch(key string, seconds int32) (err error) {
 }
 
 // withWorkerFromPool does the same thing as withConnFromPool, but pipelines requests.
-func (c *PipeliningClient) withWorkerFromPool(dataToWrite string, readFn func(*BufferedReader) error) (err error) {
+func (c *PipeliningClient) withWorkerFromPool(dataToWrite []byte, readFn func(*BufferedReader) error) (err error) {
 	// Returns error or nil
 	return <-c.manager.sendRequestToWorker(dataToWrite, readFn)
 }
 
+func (c *PipeliningClient) withWorkerFromPoolAsync(dataToWrite []byte, readFn func(*BufferedReader) error) {
+	// Returns error or nil
+	c.manager.sendRequestToWorker(dataToWrite, readFn)
+}
+
+func getIntFromByteSlice(header []byte) (int, error) {
+	total := 0
+	for i, c := range header {
+		if c < '0' || c > '9' {
+			if c == '\r' || c == ' ' {
+				if i == 0 {
+					return 0, errors.New("expected nonnegative integer but got empty string")
+				}
+				return total, nil
+			}
+			return 0, fmt.Errorf("expected nonnegative integer but got byte %x", int(c))
+		}
+		total = total*10 + int(c-'0')
+	}
+	return 0, errors.New("unexpected end of buffer")
+}
+
+func getLengthForValueResponse(header []byte) (int, error) {
+	argNum := 0
+	for i, c := range header {
+		// VALUE <key> <flags> <len> [<castoken>]\r\n
+		if c == ' ' {
+			argNum++
+			if argNum == 3 {
+				return getIntFromByteSlice(header[i+1:])
+			}
+		}
+	}
+
+	return 0, errors.New("missing arg for response length")
+}
+
+func parseResponseValues(header []byte, reader *BufferedReader) ([]byte, message.ResponseType) {
+	// fmt.Fprintf(os.Stderr, "In parseResponseValues %q", header)
+	result := header
+	for {
+		bodyLength, err := getLengthForValueResponse(header)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to parse values: %v", err)
+			return nil, message.RESPONSE_MC_PROTOCOLERROR
+		}
+		originalLen := len(header)
+		responseEnd := originalLen + bodyLength + 2
+		fmt.Fprintf(os.Stderr, "bodyLength=%d\n", bodyLength)
+		// https://github.com/golang/go/wiki/SliceTricks extend()
+		result = append(result, make([]byte, bodyLength+7)...)
+		result = result[:responseEnd]
+
+		_, err = reader.Read(result[originalLen:responseEnd])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to read value data: %v", err)
+			return nil, message.RESPONSE_MC_PROTOCOLERROR
+		}
+
+		header, err = reader.ReadBytes('\n')
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to read value data: %v", err)
+			return nil, message.RESPONSE_MC_PROTOCOLERROR
+		}
+		if bytes.Equal(header, resultEnd) {
+			// Just enough space for 5 bytes was already allocated
+			return append(result, header...), message.RESPONSE_MC_VALUE
+		}
+		if !bytes.HasPrefix(header, resultValuePrefix) {
+			fmt.Fprintf(os.Stderr, "Expected next response line to start with either VALUE or END but got %q\n", header)
+			return nil, message.RESPONSE_MC_PROTOCOLERROR
+		}
+	}
+}
+
+func parseMemcacheResponse(header []byte, reader *BufferedReader) ([]byte, message.ResponseType) {
+	switch len(header) {
+	case 4:
+		if bytes.Equal(header, resultOK) {
+			return header, message.RESPONSE_MC_OK
+		}
+	case 5:
+		if bytes.Equal(header, resultEnd) {
+			return header, message.RESPONSE_MC_END
+		}
+	case 8:
+		if bytes.Equal(header, resultStored) {
+			return header, message.RESPONSE_MC_STORED
+		}
+		if bytes.Equal(header, resultExists) {
+			return header, message.RESPONSE_MC_EXISTS
+		}
+	case 9:
+		if bytes.Equal(header, resultTouched) {
+			return header, message.RESPONSE_MC_TOUCHED
+		}
+		if bytes.Equal(header, resultDeleted) {
+			return header, message.RESPONSE_MC_DELETED
+		}
+	case 11:
+		if bytes.Equal(header, resultNotFound) {
+			return header, message.RESPONSE_MC_NOT_FOUND
+		}
+	case 12:
+		if bytes.Equal(header, resultNotStored) {
+			return header, message.RESPONSE_MC_NOT_STORED
+		}
+	}
+	if bytes.HasPrefix(header, resultValuePrefix) {
+		return parseResponseValues(header, reader)
+	}
+	return nil, message.RESPONSE_MC_PROTOCOLERROR
+}
+
+func (c *PipeliningClient) SendProxiedMessageAsync(command *message.SingleMessage) {
+	c.withWorkerFromPoolAsync(command.RequestData, func(reader *BufferedReader) error {
+		header, err := reader.ReadBytes('\n')
+		if err != nil {
+			command.HandleReceiveError(err)
+			return err
+		}
+		fullResponseBody, responseType := parseMemcacheResponse(header, reader)
+		if fullResponseBody == nil {
+			command.HandleReceiveError(message.RESPONSE_ERROR_UNKNOWN_COMMAND)
+			return err
+		}
+		command.HandleReceiveResponse(fullResponseBody, responseType)
+		return nil
+	})
+}
+
 func (c *PipeliningClient) get(keys []string, cb func(*Item)) error {
-	writeCmd := "gets " + strings.Join(keys, " ") + "\r\n"
+	writeCmd := []byte("gets " + strings.Join(keys, " ") + "\r\n")
 	//DebugLog("Called get(keys[])")
 	return c.withWorkerFromPool(writeCmd, func(r *BufferedReader) error {
 		//DebugLog("Calling parseGet")
@@ -369,8 +505,8 @@ func (c *PipeliningClient) get(keys []string, cb func(*Item)) error {
 
 // flushAll sends the flush_all command to c.addr
 func (c *PipeliningClient) flushAll() error {
-	return c.withWorkerFromPool("flush_all\r\n", func(r *BufferedReader) error {
-		line, err := r.ReadSlice('\n')
+	return c.withWorkerFromPool([]byte("flush_all\r\n"), func(r *BufferedReader) error {
+		line, err := r.ReadBytes('\n')
 		if err != nil {
 			return err
 		}
@@ -392,11 +528,11 @@ func (c *PipeliningClient) touch(keys []string, expiration int32) error {
 		}
 	}
 
-	return c.withWorkerFromPool(buf.String(), func(r *BufferedReader) error {
+	return c.withWorkerFromPool(buf.Bytes(), func(r *BufferedReader) error {
 		// Process results in same order as written
 		var err error
 		for range keys {
-			line, err := r.ReadSlice('\n')
+			line, err := r.ReadBytes('\n')
 			if err != nil {
 				return err
 			}
@@ -442,7 +578,7 @@ func (c *PipeliningClient) GetMultiArray(keys []string) ([]*Item, error) {
 func parseGetResponse(r *BufferedReader, cb func(*Item)) error {
 	for {
 		//DebugLog(fmt.Sprintf("Start readSlice"))
-		line, err := r.ReadSlice('\n')
+		line, err := r.ReadBytes('\n')
 		if err != nil {
 			//DebugLog(fmt.Sprintf("Fail readSlice: %v", err))
 			return err
@@ -480,7 +616,7 @@ func scanGetResponseLine(line []byte, it *Item) (size int, err error) {
 		// "VALUE x 0 1\r\n" is the shortest possible message, and that is 13 bytes long.
 		return -1, fmt.Errorf("Line is too short: %q", line)
 	}
-	if !bytes.Equal(line[:6], valuePrefix) {
+	if !bytes.HasPrefix(line, resultValuePrefix) {
 		return -1, fmt.Errorf("Expected line to begin with \"VALUE \": %q", line)
 	}
 	if !bytes.Equal(line[len(line)-2:], crlf) {
@@ -619,8 +755,8 @@ func (c *PipeliningClient) populateOne(verb string, item *Item) error {
 		writeString = fmt.Sprintf("%s %s %d %d %d\r\n%s\r\n",
 			verb, item.Key, item.Flags, item.Expiration, len(item.Value), item.Value)
 	}
-	return c.withWorkerFromPool(writeString, func(r *BufferedReader) error {
-		line, err := r.ReadSlice('\n')
+	return c.withWorkerFromPool([]byte(writeString), func(r *BufferedReader) error {
+		line, err := r.ReadBytes('\n')
 		if err != nil {
 			return err
 		}
@@ -639,7 +775,7 @@ func (c *PipeliningClient) populateOne(verb string, item *Item) error {
 }
 
 func readLineAndExpect(reader *BufferedReader, expect []byte) error {
-	line, err := reader.ReadSlice('\n')
+	line, err := reader.ReadBytes('\n')
 	if err != nil {
 		return err
 	}
@@ -661,14 +797,14 @@ func readLineAndExpect(reader *BufferedReader, expect []byte) error {
 // Delete deletes the item with the provided key. The error ErrCacheMiss is
 // returned if the item didn't already exist in the cache.
 func (c *PipeliningClient) Delete(key string) error {
-	return c.withWorkerFromPool("delete "+key+"\r\n", func(r *BufferedReader) error {
+	return c.withWorkerFromPool([]byte("delete "+key+"\r\n"), func(r *BufferedReader) error {
 		return readLineAndExpect(r, resultDeleted)
 	})
 }
 
 // DeleteAll deletes all items in the cache.
 func (c *PipeliningClient) DeleteAll() error {
-	return c.withWorkerFromPool("flush_all\r\n", func(r *BufferedReader) error {
+	return c.withWorkerFromPool([]byte("flush_all\r\n"), func(r *BufferedReader) error {
 		return readLineAndExpect(r, resultDeleted)
 	})
 }
@@ -695,8 +831,8 @@ func (c *PipeliningClient) Decrement(key string, delta uint64) (newValue uint64,
 func (c *PipeliningClient) incrDecr(verb, key string, delta uint64) (uint64, error) {
 	var val uint64
 	writeString := fmt.Sprintf("%s %s %d\r\n", verb, key, delta)
-	err := c.withWorkerFromPool(writeString, func(r *BufferedReader) error {
-		line, err := r.ReadSlice('\n')
+	err := c.withWorkerFromPool([]byte(writeString), func(r *BufferedReader) error {
+		line, err := r.ReadBytes('\n')
 		if err != nil {
 			return err
 		}

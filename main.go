@@ -7,7 +7,7 @@ package main
 
 import (
 	"github.com/TysonAndre/golemproxy/config"
-	"github.com/TysonAndre/golemproxy/server"
+	"github.com/TysonAndre/golemproxy/memcache/proxy"
 
 	"flag"
 	"fmt"
@@ -20,14 +20,14 @@ func main() {
 	flag.Parse()
 	configFile := *configFileFlag
 	if configFile == "" {
-		fmt.Fprintf(os.Stderr, "-config path/to/config.yml is required")
+		fmt.Fprintf(os.Stderr, "-config path/to/config.yml is required\n")
 		flag.Usage()
 		os.Exit(1)
 	}
 	configs, err := config.ParseFile(configFile)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Invalid config file %q: %v", configFile, err)
+		fmt.Fprintf(os.Stderr, "Invalid config file %q: %v\n", configFile, err)
 	}
-	fmt.Fprintf(os.Stderr, "Starting: %#v\n", configs)
-	server.Run(configs)
+	fmt.Fprintf(os.Stderr, "Starting: %#v\n\n", configs)
+	proxy.Run(configs)
 }
