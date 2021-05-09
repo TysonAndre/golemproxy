@@ -194,13 +194,24 @@ func handleCommand(reader *bufio.Reader, responses *responsequeue.ResponseQueue,
 		}
 		return err
 	}
-	if len(header) < 2 || header[len(header)-2] != '\r' {
-		return errors.New("request header did not end with \\r\\n")
+	headerLen := len(header)
+	if headerLen < 2 {
+		return errors.New("request too short")
 	}
 
 	i := bytes.IndexByte(header, ' ')
 	if i <= 1 {
 		return errors.New("empty request")
+	}
+	// If a client sends the carriage return in the wrong place, close that client,
+	// the client might not be properly validating keys.
+	carriageReturnPos := bytes.IndexByte(header, '\r')
+	if carriageReturnPos != headerLen-2 {
+		if carriageReturnPos < 0 {
+			return errors.New("request header did not have carriage return in the expected position")
+		} else {
+			return errors.New("request header had carriage return in an unexpected position")
+		}
 	}
 
 	// fmt.Fprintf(os.Stderr, "got request %q i=%d\n", header, i)
