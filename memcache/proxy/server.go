@@ -37,19 +37,6 @@ var (
 
 const MAX_ITEM_SIZE = 1 << 20
 
-// extractKeys extracts space-separated memcached keys from the bytes of a line
-func extractKeys(line []byte) []string {
-	parts := bytes.Split(line, space)
-	result := make([]string, 0, len(line))
-	for _, val := range parts {
-		if len(val) == 0 {
-			continue
-		}
-		result = append(result, string(val))
-	}
-	return result
-}
-
 // itob converts an integer to the bytes to represent that integer
 func itob(value int) []byte {
 	// TODO: optimize
@@ -69,7 +56,6 @@ func indexByteOffset(data []byte, c byte, offset int) int {
 // request is "get key1 key2 key3\r\n"
 func handleGet(requestHeader []byte, responses *responsequeue.ResponseQueue, remote memcache.ClientInterface) error {
 	// TODO: Check for malformed get command (e.g. stray \r)
-	m := &message.SingleMessage{}
 
 	keyI := bytes.IndexByte(requestHeader, ' ')
 	if keyI < 0 {
@@ -77,6 +63,7 @@ func handleGet(requestHeader []byte, responses *responsequeue.ResponseQueue, rem
 	}
 	nextKeyI := indexByteOffset(requestHeader, ' ', keyI+1)
 	if nextKeyI < 0 {
+		m := &message.SingleMessage{}
 		key := requestHeader[keyI+1 : len(requestHeader)-2]
 		if len(key) == 0 {
 			return errors.New("missing key")
@@ -87,7 +74,34 @@ func handleGet(requestHeader []byte, responses *responsequeue.ResponseQueue, rem
 		responses.RecordOutgoingRequest(m)
 		return nil
 	}
-	return errors.New("multiget unsupported")
+	keys := bytes.Split(requestHeader, space)
+	if len(keys) == 0 {
+		return errors.New("missing key")
+	}
+	for _, key := range keys {
+		if len(key) == 0 {
+			return errors.New("unexpected space")
+		}
+	}
+	fragments := make([]message.SingleMessage, len(keys))
+	for i, key := range keys {
+		requestFragment := make([]byte, keyI+3+len(key))
+		// 'get ' + key + '\r\n'
+		copy(requestFragment, requestHeader[:keyI+1])
+		copy(requestFragment[keyI+1:], key)
+		copy(requestFragment[keyI+1+len(key):], "\r\n")
+		m := &fragments[i]
+		m.HandleSendRequest(requestFragment, key, message.REQUEST_MC_GET)
+		remote.SendProxiedMessageAsync(m)
+		// responses.RecordOutgoingRequest(m)
+	}
+
+	fragmentedRequest := &message.FragmentedMessage{
+		Fragments: fragments,
+	}
+	responses.RecordOutgoingRequest(fragmentedRequest)
+
+	return nil
 }
 
 func handleDelete(requestHeader []byte, responses *responsequeue.ResponseQueue, remote memcache.ClientInterface) error {

@@ -369,6 +369,7 @@ func getLengthForValueResponse(header []byte) (int, error) {
 func parseResponseValues(header []byte, reader *BufferedReader) ([]byte, message.ResponseType) {
 	// fmt.Fprintf(os.Stderr, "In parseResponseValues %q", header)
 	result := header
+	isFirst := true
 	for {
 		bodyLength, err := getLengthForValueResponse(header)
 		if err != nil {
@@ -377,8 +378,15 @@ func parseResponseValues(header []byte, reader *BufferedReader) ([]byte, message
 		}
 		originalLen := len(header)
 		responseEnd := originalLen + bodyLength + 2
-		// https://github.com/golang/go/wiki/SliceTricks extend()
-		result = append(result, make([]byte, bodyLength+7)...)
+		// The capacity of a slice is the number of elements in the underlying array, counting from the first element in the slice.
+		if responseEnd > cap(result) {
+			if isFirst {
+				result = append(result, make([]byte, bodyLength+7)...)
+			} else {
+				// Ensure the result size is at least doubled to reduce copying
+				result = append(result, make([]byte, len(result)+bodyLength+7)...)
+			}
+		}
 		result = result[:responseEnd]
 
 		_, err = reader.Read(result[originalLen:responseEnd])
@@ -400,6 +408,7 @@ func parseResponseValues(header []byte, reader *BufferedReader) ([]byte, message
 			fmt.Fprintf(os.Stderr, "Expected next response line to start with either VALUE or END but got %q\n", header)
 			return nil, message.RESPONSE_MC_PROTOCOLERROR
 		}
+		isFirst = false
 	}
 }
 

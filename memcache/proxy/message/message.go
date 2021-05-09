@@ -61,7 +61,7 @@ type SingleMessage struct {
 type FragmentedMessage struct {
 	MessageLinkedListEntry
 	// Pointers to 2 or more non-null messages
-	Fragments []*SingleMessage
+	Fragments []SingleMessage
 }
 
 // type MessageCombiner func([]*SingleMessage) ([]byte, *ResponseError)
@@ -100,10 +100,11 @@ func (message *FragmentedMessage) AwaitResponseBytes() ([]byte, *ResponseError) 
 }
 
 // Combine the VALUE key\r\n
-func CombineMemcacheMultiget(Fragments []*SingleMessage) ([]byte, *ResponseError) {
+func CombineMemcacheMultiget(fragments []SingleMessage) ([]byte, *ResponseError) {
 	var combination []byte
-	n := len(Fragments)
-	for i, messageFragment := range Fragments {
+	n := len(fragments)
+	for i := 0; i < n; i++ {
+		messageFragment := &fragments[i]
 		responseOfFragment, err := messageFragment.AwaitResponseBytes()
 		if err != nil {
 			// No need to wait for the other responses
