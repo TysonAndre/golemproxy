@@ -3,6 +3,7 @@ package memcache
 import (
 	"errors"
 	"fmt"
+	"os"
 	"sync"
 	"time"
 )
@@ -220,6 +221,25 @@ func workerForConn(workChan <-chan *workRequest, cf ConnectionFactory) {
 		}
 	}
 
+	rejectPendingRequests := func(request *workRequest, err error) {
+		request.errChan <- err
+		close(request.errChan)
+		for {
+			select {
+			case otherRequest, ok := <-workChan:
+				// fmt.Fprintf(os.Stderr, "Closing another request\n")
+				if !ok {
+					return
+				}
+				otherRequest.errChan <- err
+				close(otherRequest.errChan)
+			default:
+				// fmt.Fprintf(os.Stderr, "No more requests seen\n")
+				return
+			}
+		}
+	}
+
 	for {
 		request, ok := <-workChan
 		// DebugLog("Received request")
@@ -230,9 +250,9 @@ func workerForConn(workChan <-chan *workRequest, cf ConnectionFactory) {
 			// DebugLog("Have a null conn, creating new conn")
 			var err error
 			connAndProcessor, err = NewWorkerConnAndProcessor(cf)
+			fmt.Fprintf(os.Stderr, "Established a connection to a memcache server, err=%v\n", err)
 			if err != nil {
-				request.errChan <- err
-				close(request.errChan)
+				rejectPendingRequests(request, err)
 				continue
 			}
 		}
@@ -274,8 +294,7 @@ func workerForConn(workChan <-chan *workRequest, cf ConnectionFactory) {
 		// There's a single command
 		err := connAndProcessor.WriteOrClose([]byte(request.DataToWrite))
 		if err != nil {
-			request.errChan <- err
-			close(request.errChan)
+			rejectPendingRequests(request, err)
 			continue
 		}
 

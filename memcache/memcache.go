@@ -124,7 +124,7 @@ var (
 )
 
 // New returns a memcache client using the provided server.
-func New(server string) *PipeliningClient {
+func New(server string, serverConnections int, timeout time.Duration) *PipeliningClient {
 	addr, err := ResolveServerAddr(server)
 	if err != nil {
 		panic(fmt.Sprintf("Failed to resolve %s", server))
@@ -133,20 +133,15 @@ func New(server string) *PipeliningClient {
 	client := &PipeliningClient{
 		addr:       addr,
 		serverRepr: server,
+		Timeout:    timeout,
 	}
-	InitWorkerManager(&(client.manager), 3, client)
+	InitWorkerManager(&(client.manager), serverConnections, client)
 	return client
 }
 
 // Finalize is called in unit tests to free up open connections.
 func (c *PipeliningClient) Finalize() {
 	c.manager.Finalize()
-	c.lk.Lock()
-	defer c.lk.Unlock()
-	for _, conn := range c.freelist {
-		conn.nc.Close()
-	}
-	c.freelist = nil
 }
 
 type ClientInterface interface {
@@ -191,8 +186,11 @@ type PipeliningClient struct {
 	manager WorkerManager
 
 	// This locks access to the free list of connections
-	lk       sync.Mutex
-	freelist []*conn
+	lk sync.Mutex
+
+	// For ketama
+	Label  string
+	Weight int
 }
 
 var _ ClientInterface = &PipeliningClient{}
@@ -233,29 +231,6 @@ func (cn *conn) extendDeadline() {
 	cn.nc.SetDeadline(time.Now().Add(cn.c.netTimeout()))
 }
 
-func (c *PipeliningClient) putFreeConn(addr net.Addr, cn *conn) {
-	c.lk.Lock()
-	defer c.lk.Unlock()
-	freelist := c.freelist
-	if len(freelist) >= c.maxIdleConns() {
-		cn.nc.Close()
-		return
-	}
-	c.freelist = append(freelist, cn)
-}
-
-func (c *PipeliningClient) getFreeConn(addr net.Addr) (cn *conn, ok bool) {
-	c.lk.Lock()
-	defer c.lk.Unlock()
-	freelist := c.freelist
-	if len(freelist) == 0 {
-		return nil, false
-	}
-	cn = freelist[len(freelist)-1]
-	c.freelist = freelist[:len(freelist)-1]
-	return cn, true
-}
-
 func (c *PipeliningClient) netTimeout() time.Duration {
 	if c.Timeout != 0 {
 		return c.Timeout
@@ -287,11 +262,11 @@ func (c *PipeliningClient) dial(addr net.Addr) (net.Conn, error) {
 		if tcpConn, ok := nc.(*net.TCPConn); ok {
 			err = tcpConn.SetWriteBuffer(100000)
 			if err != nil {
-				fmt.Printf("Failed SetWriteBuffer: %v\n", err)
+				fmt.Fprintf(os.Stderr, "Failed SetWriteBuffer: %v\n", err)
 			}
 			err = tcpConn.SetReadBuffer(100000)
 			if err != nil {
-				fmt.Printf("Failed SetReadBuffer: %v\n", err)
+				fmt.Fprintf(os.Stderr, "Failed SetReadBuffer: %v\n", err)
 			}
 		}
 		return nc, nil
@@ -304,19 +279,15 @@ func (c *PipeliningClient) dial(addr net.Addr) (net.Conn, error) {
 	return nil, err
 }
 
+// getConn establishes a brand new connection
 func (c *PipeliningClient) getConn() (*conn, error) {
 	addr := c.addr
-	cn, ok := c.getFreeConn(addr)
-	if ok {
-		cn.extendDeadline()
-		return cn, nil
-	}
 	nc, err := c.dial(addr)
 	if err != nil {
 		return nil, err
 	}
 	// NoDelay is the default
-	cn = &conn{
+	cn := &conn{
 		nc:   nc,
 		addr: addr,
 		// XXX testing
@@ -363,11 +334,6 @@ func (c *PipeliningClient) withWorkerFromPool(dataToWrite []byte, readFn func(*B
 	return <-c.manager.sendRequestToWorker(dataToWrite, readFn)
 }
 
-func (c *PipeliningClient) withWorkerFromPoolAsync(dataToWrite []byte, readFn func(*BufferedReader) error) {
-	// Returns error or nil
-	c.manager.sendRequestToWorker(dataToWrite, readFn)
-}
-
 func getIntFromByteSlice(header []byte) (int, error) {
 	total := 0
 	for i, c := range header {
@@ -411,7 +377,6 @@ func parseResponseValues(header []byte, reader *BufferedReader) ([]byte, message
 		}
 		originalLen := len(header)
 		responseEnd := originalLen + bodyLength + 2
-		fmt.Fprintf(os.Stderr, "bodyLength=%d\n", bodyLength)
 		// https://github.com/golang/go/wiki/SliceTricks extend()
 		result = append(result, make([]byte, bodyLength+7)...)
 		result = result[:responseEnd]
@@ -478,20 +443,24 @@ func parseMemcacheResponse(header []byte, reader *BufferedReader) ([]byte, messa
 }
 
 func (c *PipeliningClient) SendProxiedMessageAsync(command *message.SingleMessage) {
-	c.withWorkerFromPoolAsync(command.RequestData, func(reader *BufferedReader) error {
+	errChan := c.manager.sendRequestToWorker(command.RequestData, func(reader *BufferedReader) error {
 		header, err := reader.ReadBytes('\n')
 		if err != nil {
-			command.HandleReceiveError(err)
 			return err
 		}
 		fullResponseBody, responseType := parseMemcacheResponse(header, reader)
 		if fullResponseBody == nil {
-			command.HandleReceiveError(message.RESPONSE_ERROR_UNKNOWN_COMMAND)
 			return err
 		}
 		command.HandleReceiveResponse(fullResponseBody, responseType)
 		return nil
 	})
+	go func() {
+		err := <-errChan
+		if err != nil {
+			command.HandleReceiveError(err)
+		}
+	}()
 }
 
 func (c *PipeliningClient) get(keys []string, cb func(*Item)) error {

@@ -6,3 +6,4 @@ _*
 remote_test
 /golemproxy
 server/server
+benchmark/benchmark

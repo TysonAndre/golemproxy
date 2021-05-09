@@ -20,7 +20,6 @@ func TestBasicCompat(t *testing.T) {
 	// TODO: Verify that the result is the same as what twemproxy's algorithm would return.
 	var compatTest = []Pair{
 		Pair{"server1", 8672},
-		Pair{"server10", 9595},
 		Pair{"server2", 10825},
 		Pair{"server3", 10057},
 		Pair{"server4", 10238},
@@ -29,28 +28,29 @@ func TestBasicCompat(t *testing.T) {
 		Pair{"server7", 10211},
 		Pair{"server8", 10251},
 		Pair{"server9", 9923},
+		Pair{"server10", 9595},
 	}
 
 	var buckets []Bucket
 
 	for i := 1; i <= 10; i++ {
 		label := fmt.Sprintf("server%d", i)
-		b := &Bucket{Label: label, Weight: 1, Data: label}
+		b := &Bucket{Label: label, Weight: 1, Data: i}
 		buckets = append(buckets, *b)
 	}
 
 	k, _ := NewKetama(buckets)
 
-	m := make(map[string]int)
+	m := make(map[int]int)
 
 	for i := uint32(0); i < 100000; i++ {
-		s := k.Get(i * uint32(3156322237)).(string)
-		m[s]++
+		idxFromKetama := k.Get(i*uint32(3156322237)) - 1
+		m[idxFromKetama]++
 	}
 
-	for _, tt := range compatTest {
+	for i, tt := range compatTest {
 		server := tt.Server
-		actualCount := m[tt.Server]
+		actualCount := m[i]
 		if actualCount != tt.ExpectedCount {
 			t.Errorf("basic compatibility check failed key=%s expected=%d got=%d", server, tt.ExpectedCount, actualCount)
 		}

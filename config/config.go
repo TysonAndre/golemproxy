@@ -3,11 +3,12 @@ package config
 import (
 	"errors"
 	"fmt"
-	"gopkg.in/yaml.v2"
 	"io/ioutil"
 	"log"
 	"strconv"
 	"strings"
+
+	"gopkg.in/yaml.v2"
 )
 
 // RawConfig is the structure unserialized from the yaml config file.
@@ -70,8 +71,9 @@ type Config struct {
 	// Backlog is the maximum number of in-flight requests to an individual proxy server. If this is exceeded, then requests from the client will be rejected
 	// TODO: implement
 	Backlog uint `yaml:"backlog"`
-	// Preconnect indicates if golemproxy should connect to remote servers before any incoming requests from the client arrive.
-	Preconnect bool `yaml:"preconnect"`
+	// Preconnect indicates if golemproxy should connect to remote servers before any incoming requests from the client arrive. (unimplemented)
+	Preconnect           bool `yaml:"preconnect"`
+	MaxServerConnections uint `yaml:"max_server_connections"`
 	// AutoEjectHosts bool `yaml:"auto_eject_hosts"`
 	Servers []TCPServer
 }
@@ -112,7 +114,12 @@ func makeServer(raw string) (TCPServer, error) {
 	if len(parts) > 2 {
 		config.Key = parts[1]
 	} else {
-		config.Key = fmt.Sprintf("%s:%d", host, port)
+		// For legacy compatibility reasons, use port for the label only when it isn't 11211
+		if port != 11211 {
+			config.Key = fmt.Sprintf("%s:%d", host, port)
+		} else {
+			config.Key = host
+		}
 	}
 	return config, nil
 }

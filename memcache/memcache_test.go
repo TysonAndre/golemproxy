@@ -46,11 +46,15 @@ func setupLocalTestServer(t skippable) bool {
 	return true
 }
 
+func NewTestClient(address string) *PipeliningClient {
+	return New(address, 1, 100*time.Millisecond)
+}
+
 func TestLocalhost(t *testing.T) {
 	if !setupLocalTestServer(t) {
 		return
 	}
-	c := New(localTestServer)
+	c := NewTestClient(localTestServer)
 	defer c.Finalize()
 	testWithClient(t, c)
 	if c.GetServer() != localTestServer {
@@ -77,7 +81,7 @@ func TestUnixSocket(t *testing.T) {
 		time.Sleep(time.Duration(25*i) * time.Millisecond)
 	}
 
-	c := New(sock)
+	c := NewTestClient(sock)
 	defer c.Finalize()
 	testWithClient(t, c)
 }
@@ -300,7 +304,7 @@ func BenchmarkSetGet(b *testing.B) {
 	}
 	benchmarkWorkerCount := 20
 	// Don't call flush_all
-	c := New(benchTestServer)
+	c := NewTestClient(benchTestServer)
 	c.MaxIdleConns = benchmarkWorkerCount + 1
 	defer c.Finalize()
 

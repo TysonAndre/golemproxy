@@ -302,7 +302,6 @@ func serveSocketServer(remote memcache.ClientInterface, l net.Listener, path str
 		}
 		if err != nil {
 			// TODO: Clean up debug code
-			println("accept error", err.Error())
 			fmt.Fprintf(os.Stderr, "accept error for %q: %v", path, err)
 			return
 		}

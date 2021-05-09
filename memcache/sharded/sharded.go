@@ -3,6 +3,7 @@ package sharded
 
 import (
 	"errors"
+	"time"
 
 	"github.com/TysonAndre/golemproxy/config"
 	"github.com/TysonAndre/golemproxy/memcache"
@@ -13,7 +14,7 @@ import (
 )
 
 type ShardedClient struct {
-	getClient func(key string) *memcache.PipeliningClient
+	getClient func(key []byte) *memcache.PipeliningClient
 	clients   []*memcache.PipeliningClient
 }
 
@@ -21,16 +22,16 @@ var _ memcache.ClientInterface = &ShardedClient{}
 
 func (c *ShardedClient) SendProxiedMessageAsync(command *message.SingleMessage) {
 	// TODO: optimize out the string copy
-	c.getClient(string(command.Key)).SendProxiedMessageAsync(command)
+	c.getClient(command.Key).SendProxiedMessageAsync(command)
 }
 
 func (c *ShardedClient) Get(key string) (item *memcache.Item, err error) {
-	return c.getClient(key).Get(key)
+	return c.getClient([]byte(key)).Get(key)
 }
 
 func (c *ShardedClient) GetMulti(keys []string) (map[string]*memcache.Item, error) {
 	if len(keys) == 1 {
-		return c.getClient(keys[0]).GetMulti(keys)
+		return c.getClient([]byte(keys[0])).GetMulti(keys)
 	} else if len(keys) == 0 {
 		return make(map[string]*memcache.Item, 0), nil
 	}
@@ -58,7 +59,7 @@ func (c *ShardedClient) GetMulti(keys []string) (map[string]*memcache.Item, erro
 
 func (c *ShardedClient) GetMultiArray(keys []string) ([]*memcache.Item, error) {
 	if len(keys) == 1 {
-		return c.getClient(keys[0]).GetMultiArray(keys)
+		return c.getClient([]byte(keys[0])).GetMultiArray(keys)
 	} else if len(keys) == 0 {
 		return nil, nil
 	}
@@ -85,11 +86,11 @@ func (c *ShardedClient) GetMultiArray(keys []string) ([]*memcache.Item, error) {
 }
 
 func (c *ShardedClient) Set(item *memcache.Item) error {
-	return c.getClient(item.Key).Set(item)
+	return c.getClient([]byte(item.Key)).Set(item)
 }
 
 func (c *ShardedClient) Delete(key string) error {
-	return c.getClient(key).Delete(key)
+	return c.getClient([]byte(key)).Delete(key)
 }
 
 func (c *ShardedClient) DeleteAll() error {
@@ -97,23 +98,23 @@ func (c *ShardedClient) DeleteAll() error {
 }
 
 func (c *ShardedClient) Touch(key string, seconds int32) error {
-	return c.getClient(key).Touch(key, seconds)
+	return c.getClient([]byte(key)).Touch(key, seconds)
 }
 
 func (c *ShardedClient) Add(item *memcache.Item) error {
-	return c.getClient(item.Key).Add(item)
+	return c.getClient([]byte(item.Key)).Add(item)
 }
 
 func (c *ShardedClient) Replace(item *memcache.Item) error {
-	return c.getClient(item.Key).Replace(item)
+	return c.getClient([]byte(item.Key)).Replace(item)
 }
 
 func (c *ShardedClient) Increment(key string, delta uint64) (newValue uint64, err error) {
-	return c.getClient(key).Increment(key, delta)
+	return c.getClient([]byte(key)).Increment(key, delta)
 }
 
 func (c *ShardedClient) Decrement(key string, delta uint64) (newValue uint64, err error) {
-	return c.getClient(key).Decrement(key, delta)
+	return c.getClient([]byte(key)).Decrement(key, delta)
 }
 
 func (c *ShardedClient) Finalize() {
@@ -143,19 +144,36 @@ func New(conf config.Config) memcache.ClientInterface {
 	clients := []*memcache.PipeliningClient{}
 	for _, serverConfig := range servers {
 		connString := fmt.Sprintf("%s:%d", serverConfig.Host, serverConfig.Port)
-		clients = append(clients, memcache.New(connString))
+		client := memcache.New(connString, int(conf.MaxServerConnections), time.Duration(conf.Timeout)*time.Millisecond)
+		client.Weight = int(serverConfig.Weight)
+		client.Label = serverConfig.Key
+		if client.Weight < 1 {
+			panic("Expected positive weight")
+		}
+		clients = append(clients, client)
 	}
+
+	unique := make(map[string]*memcache.PipeliningClient)
+	for _, client := range clients {
+		unique[client.Label] = client
+	}
+	if len(unique) != len(servers) {
+		panic(fmt.Sprintf("List of server labels is not unique: %#v", unique))
+	}
+
 	if len(clients) == 1 {
 		return clients[0]
 	}
-	// var hasher = createHasher(conf.Hash)
+	hasher := createHasher(conf.Hash)
+	distribution := createDistribution(conf.Distribution, clients)
 
 	return &ShardedClient{
-		getClient: func(key string) *memcache.PipeliningClient {
+		getClient: func(key []byte) *memcache.PipeliningClient {
 			// FIXME: implement or reuse hash ring algorithm
-			// hash := hasher(key)
-			// fmt.Fprintf(os.Stderr, "Hash of %q is %d\n", key, hash)
-			return clients[0]
+			hash := hasher(key)
+			clientIdx := distribution(hash)
+			// fmt.Fprintf(os.Stderr, "Hash of %q is %d, clientIdx = %d\n", key, hash, clientIdx)
+			return clients[clientIdx]
 		},
 		clients: clients,
 	}

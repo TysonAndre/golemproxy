@@ -20,7 +20,7 @@ func TestLoadExample(t *testing.T) {
 	testutil.ExpectEquals(
 		t,
 		[]TCPServer{
-			{Host: "127.0.0.1", Port: 11211, Key: "127.0.0.1:11211", Weight: 1},
+			{Host: "127.0.0.1", Port: 11211, Key: "127.0.0.1", Weight: 1},
 			{Host: "127.0.0.1", Port: 11212, Key: "127.0.0.1:11212", Weight: 1},
 		},
 		main.Servers,

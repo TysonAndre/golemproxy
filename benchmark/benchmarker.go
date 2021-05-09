@@ -13,7 +13,7 @@ var WORKERS = flag.Int("workers", 10, "number of clients to create to send seque
 var LISTEN_ADDR = flag.String("server", "127.0.0.1:21211", "address of the server to connect to")
 
 func benchmarker(total *int) {
-	client := memcache.New(*LISTEN_ADDR)
+	client := memcache.New(*LISTEN_ADDR, 1, 1*time.Second)
 	item := memcache.Item{
 		Key:   "key",
 		Value: []byte("long long value"),
