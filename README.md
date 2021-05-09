@@ -8,7 +8,7 @@ The memcached client this uses is based on https://github.com/bradfitz/gomemcach
 - For the most part, requests are sent from the client unmodified, and responses are sent from the server unmodified,
   though multigets with 2 or more keys need to be split up for requests and combined for responses.
 
-**This is a work in progress - it can only proxy some types of commands and networking failure modes have not been tested**
+**This is a work in progress - it can only proxy some types of commands and networking failure modes have not been tested. Other commands are proxied incorrectly.**
 
 ### Motivation
 

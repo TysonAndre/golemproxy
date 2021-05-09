@@ -2,8 +2,6 @@
 package message
 
 import (
-	"fmt"
-	"os"
 	"sync"
 )
 
@@ -18,6 +16,7 @@ const (
 	RESPONSE_MC_DELETED       ResponseType = 7
 	RESPONSE_MC_TOUCHED       ResponseType = 8
 	RESPONSE_MC_OK            ResponseType = 8
+	RESPONSE_MC_NUMBER        ResponseType = 9
 )
 
 const (
@@ -26,6 +25,7 @@ const (
 	REQUEST_MC_GETS    RequestType = 3
 	REQUEST_MC_SET     RequestType = 4
 	REQUEST_MC_DELETE  RequestType = 5
+	REQUEST_MC_INCR    RequestType = 6
 )
 
 type RequestType uint8
@@ -71,6 +71,7 @@ type FragmentedMessage struct {
 // 3. A connection on the proxy waits to lock the mutext to receive the response/error.
 
 func (message *SingleMessage) HandleSendRequest(data []byte, key []byte, requestType RequestType) {
+	// fmt.Fprintf(os.Stderr, "HandleSendRequest %q %q\n", string(data), string(key))
 	message.Mutex.Lock()
 	message.RequestData = data
 	message.Key = key
@@ -84,7 +85,7 @@ func (message *SingleMessage) HandleReceiveResponse(data []byte, responseType Re
 }
 
 func (message *SingleMessage) HandleReceiveError(err error) {
-	fmt.Fprintf(os.Stderr, "TODO: Handle error %v\n", err)
+	// fmt.Fprintf(os.Stderr, "TODO: Handle error %v\n", err)
 	message.ResponseError = RESPONSE_ERROR_UNEXPECTED_TYPE
 	message.Mutex.Unlock()
 }
@@ -116,11 +117,11 @@ func CombineMemcacheMultiget(fragments []SingleMessage) ([]byte, *ResponseError)
 		// expect part to end in "END\r\n" - add this to the last buffer and remove it from other buggers
 		if i == n-1 {
 			combination = append(combination, responseOfFragment...)
-		} else if combination == nil {
-			combination = responseOfFragment[:len(responseOfFragment)-END_LINE_LENGTH]
+			break
 		} else {
 			combination = append(combination, responseOfFragment[:len(responseOfFragment)-END_LINE_LENGTH]...)
 		}
 	}
+	// fmt.Fprintf(os.Stderr, "Combined response=%q\n", string(combination))
 	return combination, nil
 }

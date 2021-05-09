@@ -1,4 +1,4 @@
-package ketama
+package distribution
 
 // Original source: https://github.com/dgryski/go-ketama/blob/master/ketama_test.go
 // TODO: Manually verify compatibility with twemproxy (not perl), including in edge cases.
@@ -19,16 +19,16 @@ func TestBasicCompat(t *testing.T) {
 	}
 	// TODO: Verify that the result is the same as what twemproxy's algorithm would return.
 	var compatTest = []Pair{
-		Pair{"server1", 8672},
-		Pair{"server2", 10825},
-		Pair{"server3", 10057},
-		Pair{"server4", 10238},
-		Pair{"server5", 9079},
-		Pair{"server6", 11149},
-		Pair{"server7", 10211},
-		Pair{"server8", 10251},
-		Pair{"server9", 9923},
-		Pair{"server10", 9595},
+		{"server1", 8672},
+		{"server2", 10825},
+		{"server3", 10057},
+		{"server4", 10238},
+		{"server5", 9079},
+		{"server6", 11149},
+		{"server7", 10211},
+		{"server8", 10251},
+		{"server9", 9923},
+		{"server10", 9595},
 	}
 
 	var buckets []Bucket

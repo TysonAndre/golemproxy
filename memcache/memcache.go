@@ -39,6 +39,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/TysonAndre/golemproxy/byteutil"
 	"github.com/TysonAndre/golemproxy/memcache/proxy/message"
 )
 
@@ -99,8 +100,8 @@ func legalKey(key string) bool {
 	if len(key) > 250 {
 		return false
 	}
-	for i := 0; i < len(key); i++ {
-		if key[i] <= ' ' || key[i] == 0x7f {
+	for _, c := range key {
+		if c <= ' ' || c == 0x7f {
 			return false
 		}
 	}
@@ -376,7 +377,7 @@ func parseResponseValues(header []byte, reader *BufferedReader) ([]byte, message
 			fmt.Fprintf(os.Stderr, "Failed to parse values: %v", err)
 			return nil, message.RESPONSE_MC_PROTOCOLERROR
 		}
-		originalLen := len(header)
+		originalLen := len(result)
 		responseEnd := originalLen + bodyLength + 2
 		// The capacity of a slice is the number of elements in the underlying array, counting from the first element in the slice.
 		if responseEnd > cap(result) {
@@ -409,10 +410,19 @@ func parseResponseValues(header []byte, reader *BufferedReader) ([]byte, message
 			return nil, message.RESPONSE_MC_PROTOCOLERROR
 		}
 		isFirst = false
+		result = append(result, header...)
 	}
 }
 
 func parseMemcacheResponse(header []byte, reader *BufferedReader) ([]byte, message.ResponseType) {
+	if len(header) <= 2 {
+		// Just "\r\n" without a message is an error
+		return nil, message.RESPONSE_MC_PROTOCOLERROR
+	}
+	if header[len(header)-2] != '\r' {
+		return nil, message.RESPONSE_MC_PROTOCOLERROR
+	}
+	// fmt.Fprintf(os.Stderr, "Got header %q\n", string(header))
 	switch len(header) {
 	case 4:
 		if bytes.Equal(header, resultOK) {
@@ -447,6 +457,15 @@ func parseMemcacheResponse(header []byte, reader *BufferedReader) ([]byte, messa
 	}
 	if bytes.HasPrefix(header, resultValuePrefix) {
 		return parseResponseValues(header, reader)
+	}
+	c := header[0]
+	if c <= '9' && c >= '0' {
+		// TODO validate uint64
+		if !byteutil.IsExclusivelyDigits(header[1 : len(header)-2]) {
+			return header, message.RESPONSE_MC_PROTOCOLERROR
+		}
+		return header, message.RESPONSE_MC_NUMBER
+
 	}
 	return nil, message.RESPONSE_MC_PROTOCOLERROR
 }

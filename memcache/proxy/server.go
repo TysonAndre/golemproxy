@@ -4,6 +4,7 @@ package proxy
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -15,19 +16,24 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/TysonAndre/golemproxy/byteutil"
 	"github.com/TysonAndre/golemproxy/config"
 	"github.com/TysonAndre/golemproxy/memcache"
 	"github.com/TysonAndre/golemproxy/memcache/proxy/message"
 	"github.com/TysonAndre/golemproxy/memcache/proxy/responsequeue"
-	"github.com/TysonAndre/golemproxy/memcache/sharded"
+	"github.com/TysonAndre/golemproxy/sharded"
 	"go4.org/strutil"
 )
 
 var (
-	space          = []byte(" ")
+	// these are all used as constants
+	noreplyBytes = []byte("noreply")
+
 	requestAdd     = []byte("add")
 	requestAppend  = []byte("append")
 	requestDelete  = []byte("delete")
+	requestIncr    = []byte("incr")
+	requestDecr    = []byte("decr")
 	requestGet     = []byte("get")
 	requestGets    = []byte("gets")
 	requestPrepend = []byte("prepend")
@@ -52,6 +58,32 @@ func indexByteOffset(data []byte, c byte, offset int) int {
 	return -1
 }
 
+// splitArgsOnSpaces returns 0 or more non-empty byte slices that do not contain spaces.
+func splitArgsOnSpaces(data []byte) ([][]byte, error) {
+	parts := [][]byte{}
+	start := 0
+	for i, c := range data {
+		if c == ' ' {
+			if i == start {
+				// Some other proxies or protocol implementations may have issues with extra spaces
+				return nil, errors.New("Unexpected extra space in memcache command")
+			}
+			parts = append(parts, data[start:i])
+			start = i + 1
+		}
+	}
+	if start >= len(data) {
+		// python-memcached is sending "set kkk-0 16 0 5 \r\n"
+		/*
+			if start > 0 {
+				return nil, errors.New("Unexpected extra space in memcache command")
+			}
+		*/
+		return parts, nil
+	}
+	return append(parts, data[start:]), nil
+}
+
 // handleGet forwards the 'get' or 'gets' (with CAS) request to a memcache client and sends a response back
 // request is "get key1 key2 key3\r\n"
 func handleGet(requestHeader []byte, responses *responsequeue.ResponseQueue, remote memcache.ClientInterface) error {
@@ -61,27 +93,22 @@ func handleGet(requestHeader []byte, responses *responsequeue.ResponseQueue, rem
 	if keyI < 0 {
 		return errors.New("missing space")
 	}
-	nextKeyI := indexByteOffset(requestHeader, ' ', keyI+1)
-	if nextKeyI < 0 {
+	keys, err := splitArgsOnSpaces(requestHeader[keyI+1 : len(requestHeader)-2])
+	if err != nil {
+		return err
+	}
+
+	if len(keys) == 0 {
+		return errors.New("missing key")
+	}
+	if len(keys) == 1 {
 		m := &message.SingleMessage{}
-		key := requestHeader[keyI+1 : len(requestHeader)-2]
-		if len(key) == 0 {
-			return errors.New("missing key")
-		}
+		key := keys[0]
 		// fmt.Fprintf(os.Stderr, "handleGet %q key=%v\n", string(requestHeader), string(key))
 		m.HandleSendRequest(requestHeader, key, message.REQUEST_MC_GET)
 		remote.SendProxiedMessageAsync(m)
 		responses.RecordOutgoingRequest(m)
 		return nil
-	}
-	keys := bytes.Split(requestHeader, space)
-	if len(keys) == 0 {
-		return errors.New("missing key")
-	}
-	for _, key := range keys {
-		if len(key) == 0 {
-			return errors.New("unexpected space")
-		}
 	}
 	fragments := make([]message.SingleMessage, len(keys))
 	for i, key := range keys {
@@ -112,74 +139,126 @@ func handleDelete(requestHeader []byte, responses *responsequeue.ResponseQueue, 
 	if keyI < 0 {
 		return errors.New("missing space")
 	}
-	nextKeyI := indexByteOffset(requestHeader, ' ', keyI+1)
-	if nextKeyI < 0 {
-		key := requestHeader[keyI+1 : len(requestHeader)-2]
-		if len(key) == 0 {
-			return errors.New("missing key")
-		}
-		m.HandleSendRequest(requestHeader, key, message.REQUEST_MC_DELETE)
-		remote.SendProxiedMessageAsync(m)
-		responses.RecordOutgoingRequest(m)
-		return nil
+	args, err := splitArgsOnSpaces(requestHeader[keyI+1 : len(requestHeader)-2])
+	if err != nil {
+		return err
 	}
-	return errors.New("delete does not support multiple keys")
+	if len(args) < 1 || len(args) > 2 {
+		return errors.New("unexpected arg count for " + string(requestHeader[:4]))
+	}
+	noreply := false
+	if len(args) == 2 {
+		if !bytes.Equal(args[1], noreplyBytes) {
+			return errors.New("expected extra arg to be noreply")
+		}
+		noreply = true
+	}
+
+	key := args[0]
+	m.HandleSendRequest(requestHeader, key, message.REQUEST_MC_DELETE)
+	remote.SendProxiedMessageAsync(m)
+	if !noreply {
+		responses.RecordOutgoingRequest(m)
+	}
+	return nil
 }
 
-func parseSetRequest(requestHeader []byte, reader *bufio.Reader) ([]byte, []byte, error) {
-	// FIXME support 'noreply'
-	// parse the number of bytes then read
-	// set key <flags> <expiry> <valuelen> [noreply]\r\n<value>\r\n
-	parts := bytes.Split(requestHeader[:len(requestHeader)-2], space)
-	if len(parts) < 5 || len(parts) > 6 {
-		return nil, nil, fmt.Errorf("unexpected word count %d for set, expected 'set key flags expiry valuelen [noreply]'", len(parts))
+func handleIncrOrDecr(requestHeader []byte, responses *responsequeue.ResponseQueue, remote memcache.ClientInterface) error {
+	// TODO: Check for malformed delete command (e.g. stray \r)
+	m := &message.SingleMessage{}
+
+	keyI := bytes.IndexByte(requestHeader, ' ')
+	if keyI < 0 {
+		return errors.New("missing space")
+	}
+	args, err := splitArgsOnSpaces(requestHeader[keyI+1 : len(requestHeader)-2])
+	if err != nil {
+		return err
+	}
+	if len(args) < 2 || len(args) > 3 {
+		return fmt.Errorf("unexpected arg count %d for %s", len(args), string(requestHeader[:4]))
+	}
+	if !byteutil.IsExclusivelyDigits(args[1]) {
+		return errors.New("expected incr or decr to be a number")
+	}
+	noreply := false
+	if len(args) == 3 {
+		if !bytes.Equal(args[2], noreplyBytes) {
+			return errors.New("expected extra arg to be noreply")
+		}
+		noreply = true
 	}
 
-	// TODO: use https://godoc.org/go4.org/strutil#ParseUintBytes
-	_, err := strutil.ParseUintBytes(parts[2], 10, 32)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to parse flags: %v", err)
+	key := args[0]
+	m.HandleSendRequest(requestHeader, key, message.REQUEST_MC_INCR)
+	remote.SendProxiedMessageAsync(m)
+	// If a request includes 'noreply' then the server would not send back a response.
+	if !noreply {
+		responses.RecordOutgoingRequest(m)
 	}
-	_, err = strutil.ParseUintBytes(parts[3], 10, 32)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to parse expiry: %v", err)
-	}
-	length, err := strutil.ParseUintBytes(parts[4], 10, 30)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to parse length: %v", err)
-	}
-	if length < 0 {
-		return nil, nil, fmt.Errorf("Wrong length: expected non-negative value")
-	}
-	if length > MAX_ITEM_SIZE {
-		return nil, nil, fmt.Errorf("Wrong length: %d exceeds MAX_ITEM_SIZE of %d", length, MAX_ITEM_SIZE)
-	}
-	fullRequestLength := len(requestHeader) + int(length) + 2
-	bytes := make([]byte, fullRequestLength)
-	copy(bytes, requestHeader)
-	n, err := io.ReadFull(reader, bytes[len(requestHeader):])
-	if err != nil {
-		return nil, nil, fmt.Errorf("Failed to read %d bytes, got %d: %v", length, n, err)
-	}
-	// skip \r\n
-	if bytes[fullRequestLength-2] != '\r' || bytes[fullRequestLength-1] != '\n' {
-		return nil, nil, fmt.Errorf("Value was not followed by \\r\\n")
-	}
-	return bytes, parts[1], nil
-
+	return nil
 }
 
 // handleSet forwards a set request to the memcache servers and returns a result.
 // TODO: Add the capability to mock successful responses before sending the request
 func handleSet(requestHeader []byte, reader *bufio.Reader, responses *responsequeue.ResponseQueue, remote memcache.ClientInterface) error {
-	m := &message.SingleMessage{}
-	requestBody, key, err := parseSetRequest(requestHeader, reader)
+	// FIXME support 'noreply'
+	// parse the number of bytes then read
+	// requestHeader is set|add|replace|insert key <flags> <expiry> <valuelen> [noreply]\r\n<value>\r\n
+	args, err := splitArgsOnSpaces(requestHeader[:len(requestHeader)-2])
 	if err != nil {
-		return err
+		return fmt.Errorf("could not parse %q: %v\n", string(requestHeader), err)
 	}
+	if len(args) < 5 || len(args) > 6 {
+		cmd := string(args[0])
+		return fmt.Errorf("unexpected word count %d for %s, expected '%s key flags expiry valuelen [noreply]'", len(args), cmd, cmd)
+	}
+
+	// TODO: use https://godoc.org/go4.org/strutil#ParseUintBytes
+	_, err = strutil.ParseUintBytes(args[2], 10, 32)
+	if err != nil {
+		return fmt.Errorf("failed to parse flags: %v", err)
+	}
+	_, err = strutil.ParseUintBytes(args[3], 10, 32)
+	if err != nil {
+		return fmt.Errorf("failed to parse expiry: %v", err)
+	}
+	length, err := strutil.ParseUintBytes(args[4], 10, 30)
+	if err != nil {
+		return fmt.Errorf("failed to parse length: %v", err)
+	}
+	if length < 0 {
+		return fmt.Errorf("Wrong length: expected non-negative value")
+	}
+	if length > MAX_ITEM_SIZE {
+		return fmt.Errorf("Wrong length: %d exceeds MAX_ITEM_SIZE of %d", length, MAX_ITEM_SIZE)
+	}
+	noreply := false
+	if len(args) == 6 {
+		if !bytes.Equal(args[5], noreplyBytes) {
+			return errors.New("expected extra arg to be noreply")
+		}
+		noreply = true
+	}
+	fullRequestLength := len(requestHeader) + int(length) + 2
+	requestBody := make([]byte, fullRequestLength)
+	copy(requestBody, requestHeader)
+	n, err := io.ReadFull(reader, requestBody[len(requestHeader):])
+	if err != nil {
+		return fmt.Errorf("Failed to read %d requestBody, got %d: %v", length, n, err)
+	}
+	// skip \r\n
+	if requestBody[fullRequestLength-2] != '\r' || requestBody[fullRequestLength-1] != '\n' {
+		return fmt.Errorf("Value was not followed by \\r\\n")
+	}
+	m := &message.SingleMessage{}
+
+	key := args[1]
 	m.HandleSendRequest(requestBody, key, message.REQUEST_MC_SET)
 	remote.SendProxiedMessageAsync(m)
-	responses.RecordOutgoingRequest(m)
+	if !noreply {
+		responses.RecordOutgoingRequest(m)
+	}
 	return nil
 }
 
@@ -241,6 +320,20 @@ func handleCommand(reader *bufio.Reader, responses *responsequeue.ResponseQueue,
 			}
 			return err
 		}
+		if bytes.HasPrefix(header, requestIncr) {
+			err := handleIncrOrDecr(header, responses, remote)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "incr request parsing failed: %s\n", err.Error())
+			}
+			return err
+		}
+		if bytes.HasPrefix(header, requestDecr) {
+			err := handleIncrOrDecr(header, responses, remote)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "decr request parsing failed: %s\n", err.Error())
+			}
+			return err
+		}
 	case 6:
 		if bytes.HasPrefix(header, requestDelete) {
 			err := handleDelete(header, responses, remote)
@@ -257,22 +350,23 @@ func handleCommand(reader *bufio.Reader, responses *responsequeue.ResponseQueue,
 			return err
 		}
 	case 7:
-		if bytes.HasPrefix(header, requestReplace) || bytes.HasPrefix(header, requestPrepend) {
+		if bytes.HasPrefix(header, requestDelete) {
 			err := handleDelete(header, responses, remote)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "delete request parsing failed: %s\n", err.Error())
+			}
+			return err
+		}
+		// replace and prepend have the same arg count as set
+		if bytes.HasPrefix(header, requestReplace) || bytes.HasPrefix(header, requestPrepend) {
+			err := handleSet(header, reader, responses, remote)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "%s request parsing failed: %s\n", string(header[:7]), err.Error())
 			}
 			return err
 		}
-		if bytes.HasPrefix(header, requestAppend) {
-			err := handleSet(header, reader, responses, remote)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "append request parsing failed: %s\n", err.Error())
-			}
-			return err
-		}
 	}
-	fmt.Fprintf(os.Stderr, "Unknown command %q", header)
+	fmt.Fprintf(os.Stderr, "Unknown command %q\n", header)
 	return errors.New("unknown command")
 }
 
@@ -307,14 +401,14 @@ func handleUnexpectedExit(listeners []net.Listener, didExit *bool) {
 	}(sigc)
 }
 
-func createUnixSocket(path string) (net.Listener, error) {
-	fmt.Fprintf(os.Stderr, "Listening for memcache requests at unix socket %q\n", path)
+func createUnixSocket(path string, serverType string) (net.Listener, error) {
+	fmt.Fprintf(os.Stderr, "Listening for %s requests at unix socket %q\n", serverType, path)
 	l, err := net.Listen("unix", path)
 	return l, err
 }
 
-func createTCPSocket(path string) (net.Listener, error) {
-	fmt.Fprintf(os.Stderr, "Listening for memcache requests at tcp server %q\n", path)
+func createTCPSocket(path string, serverType string) (net.Listener, error) {
+	fmt.Fprintf(os.Stderr, "Listening for %s requests at tcp server %q\n", serverType, path)
 	l, err := net.Listen("tcp", path)
 	return l, err
 }
@@ -335,7 +429,51 @@ func serveSocketServer(remote memcache.ClientInterface, l net.Listener, path str
 	}
 }
 
-func Run(configs map[string]config.Config) {
+func serveStatsServer(statsPortFlag uint, didExit *bool) {
+	if statsPortFlag == 0 || statsPortFlag >= (1<<16) {
+		return
+	}
+	var l net.Listener
+	var err error
+
+	statsServerAddr := fmt.Sprintf("127.0.0.1:%d", statsPortFlag)
+	l, err = createTCPSocket(statsServerAddr, "stats")
+	if err != nil {
+		// TODO: Clean up the rest of the sockets
+		fmt.Fprintf(os.Stderr, "Listen error at %s: %v\n", statsServerAddr, err)
+		return
+	}
+
+	go func() {
+		for {
+			fd, err := l.Accept()
+			if *didExit {
+				return
+			}
+			if err != nil {
+				// TODO: Clean up debug code
+				fmt.Fprintf(os.Stderr, "accept error for %s: %v", statsServerAddr, err)
+				return
+			}
+
+			go func() {
+				data := map[string]interface{}{
+					"command": "golemproxy",
+				}
+				bytes, err := json.Marshal(data)
+				if err != nil {
+					bytes = append([]byte("ERROR: "), []byte(err.Error())...)
+				}
+				bytes = append(bytes, '\r', '\n')
+				fd.Write(bytes)
+
+				fd.Close()
+			}()
+		}
+	}()
+}
+
+func Run(configs map[string]config.Config, statsPort uint) {
 	var wg sync.WaitGroup
 	wg.Add(len(configs))
 
@@ -350,9 +488,9 @@ func Run(configs map[string]config.Config) {
 		var err error
 		i := strings.IndexRune(socketPath, ':')
 		if i >= 0 {
-			l, err = createTCPSocket(socketPath)
+			l, err = createTCPSocket(socketPath, "memcache")
 		} else {
-			l, err = createUnixSocket(socketPath)
+			l, err = createUnixSocket(socketPath, "memcache")
 		}
 		if err != nil {
 			// TODO: Clean up the rest of the sockets
@@ -370,6 +508,8 @@ func Run(configs map[string]config.Config) {
 			wg.Done()
 		}()
 	}
+	serveStatsServer(statsPort, &didExit)
+
 	handleUnexpectedExit(listeners, &didExit)
 	wg.Wait()
 }

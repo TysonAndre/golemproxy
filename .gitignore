@@ -7,3 +7,7 @@ remote_test
 /golemproxy
 server/server
 benchmark/benchmark
+
+# nosetests integration tests from twemproxy
+_binaries
+__pycache__

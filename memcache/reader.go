@@ -13,7 +13,7 @@ type BufferedReader struct {
 
 var ErrPreviousRequestFailed = errors.New("A previous request failed")
 
-// ReadBytes returns a copy of bytes that lasts until the next read from the buffer
+// ReadBytes returns a brand new byte slice that does not overlap with other byte slices
 func (reader *BufferedReader) ReadBytes(delim byte) ([]byte, error) {
 	if reader.failed == true {
 		return nil, ErrPreviousRequestFailed
