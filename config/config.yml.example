@@ -3,15 +3,16 @@
 main:
   #listen: /var/tmp/golemproxy.0
   listen: 127.0.0.1:21211
-  # TODO: Actually support these config settings
+  # TODO: Actually support the failover pool
   failover: main-fail
   hash: fnv1a_64
   distribution: ketama
+  # TODO: Actually support auto_eject_hosts
   auto_eject_hosts: false
   server_retry_timeout: 5000
   timeout: 1000
-  backlog: 1024
-  preconnect: true
+  # TODO: Use a different name for the maximum backlog of unprocessed requests
+  # backlog: 1024
   servers:
 #     IP:port:weight       Name
     - 127.0.0.1:11211:1
