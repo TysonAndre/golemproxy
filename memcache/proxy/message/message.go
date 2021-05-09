@@ -26,6 +26,7 @@ const (
 	REQUEST_MC_SET     RequestType = 4
 	REQUEST_MC_DELETE  RequestType = 5
 	REQUEST_MC_INCR    RequestType = 6
+	REQUEST_MC_CAS     RequestType = 7
 )
 
 type RequestType uint8

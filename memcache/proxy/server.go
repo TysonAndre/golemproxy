@@ -31,14 +31,21 @@ var (
 
 	requestAdd     = []byte("add")
 	requestAppend  = []byte("append")
+	requestCas     = []byte("cas")
 	requestDelete  = []byte("delete")
 	requestIncr    = []byte("incr")
 	requestDecr    = []byte("decr")
 	requestGet     = []byte("get")
 	requestGets    = []byte("gets")
 	requestPrepend = []byte("prepend")
+	requestQuit    = []byte("quit")
 	requestReplace = []byte("replace")
 	requestSet     = []byte("set")
+	requestTouch   = []byte("touch")
+)
+
+var (
+	errQuit = errors.New("quit")
 )
 
 const MAX_ITEM_SIZE = 1 << 20
@@ -176,10 +183,10 @@ func handleIncrOrDecr(requestHeader []byte, responses *responsequeue.ResponseQue
 		return err
 	}
 	if len(args) < 2 || len(args) > 3 {
-		return fmt.Errorf("unexpected arg count %d for %s", len(args), string(requestHeader[:4]))
+		return fmt.Errorf("unexpected arg count %d for %s", len(args), string(requestHeader[:keyI]))
 	}
 	if !byteutil.IsExclusivelyDigits(args[1]) {
-		return errors.New("expected incr or decr to be a number")
+		return fmt.Errorf("expected argument for %s to be a number", string(requestHeader[:keyI]))
 	}
 	noreply := false
 	if len(args) == 3 {
@@ -199,6 +206,35 @@ func handleIncrOrDecr(requestHeader []byte, responses *responsequeue.ResponseQue
 	return nil
 }
 
+func validateKey(key []byte) error {
+	if len(key) > 250 {
+		return errors.New("memcache key too long")
+	}
+	for _, c := range key {
+		if c <= ' ' || c == 0x7f {
+			return fmt.Errorf("invalid memcache key byte 0x%x", c)
+		}
+	}
+	return nil
+}
+
+func validateKeyFlagsExpiry(args [][]byte) error {
+	err := validateKey(args[1])
+	if err != nil {
+		return err
+	}
+	// TODO: use https://godoc.org/go4.org/strutil#ParseUintBytes
+	_, err = strutil.ParseUintBytes(args[2], 10, 32)
+	if err != nil {
+		return fmt.Errorf("failed to parse flags: %v", err)
+	}
+	_, err = strutil.ParseUintBytes(args[3], 10, 32)
+	if err != nil {
+		return fmt.Errorf("failed to parse expiry: %v", err)
+	}
+	return nil
+}
+
 // handleSet forwards a set request to the memcache servers and returns a result.
 // TODO: Add the capability to mock successful responses before sending the request
 func handleSet(requestHeader []byte, reader *bufio.Reader, responses *responsequeue.ResponseQueue, remote memcache.ClientInterface) error {
@@ -214,15 +250,11 @@ func handleSet(requestHeader []byte, reader *bufio.Reader, responses *responsequ
 		return fmt.Errorf("unexpected word count %d for %s, expected '%s key flags expiry valuelen [noreply]'", len(args), cmd, cmd)
 	}
 
-	// TODO: use https://godoc.org/go4.org/strutil#ParseUintBytes
-	_, err = strutil.ParseUintBytes(args[2], 10, 32)
+	err = validateKeyFlagsExpiry(args)
 	if err != nil {
-		return fmt.Errorf("failed to parse flags: %v", err)
+		return err
 	}
-	_, err = strutil.ParseUintBytes(args[3], 10, 32)
-	if err != nil {
-		return fmt.Errorf("failed to parse expiry: %v", err)
-	}
+
 	length, err := strutil.ParseUintBytes(args[4], 10, 30)
 	if err != nil {
 		return fmt.Errorf("failed to parse length: %v", err)
@@ -236,6 +268,71 @@ func handleSet(requestHeader []byte, reader *bufio.Reader, responses *responsequ
 	noreply := false
 	if len(args) == 6 {
 		if !bytes.Equal(args[5], noreplyBytes) {
+			return errors.New("expected extra arg to be noreply")
+		}
+		noreply = true
+	}
+	fullRequestLength := len(requestHeader) + int(length) + 2
+	requestBody := make([]byte, fullRequestLength)
+	copy(requestBody, requestHeader)
+	n, err := io.ReadFull(reader, requestBody[len(requestHeader):])
+	if err != nil {
+		return fmt.Errorf("Failed to read %d requestBody, got %d: %v", length, n, err)
+	}
+	// skip \r\n
+	if requestBody[fullRequestLength-2] != '\r' || requestBody[fullRequestLength-1] != '\n' {
+		return fmt.Errorf("Value was not followed by \\r\\n")
+	}
+	m := &message.SingleMessage{}
+
+	key := args[1]
+	m.HandleSendRequest(requestBody, key, message.REQUEST_MC_CAS)
+	remote.SendProxiedMessageAsync(m)
+	if !noreply {
+		responses.RecordOutgoingRequest(m)
+	}
+	return nil
+}
+
+// handleCas forwards a cas request to the memcache servers and returns a result.
+func handleCas(requestHeader []byte, reader *bufio.Reader, responses *responsequeue.ResponseQueue, remote memcache.ClientInterface) error {
+	// FIXME support 'noreply'
+	// parse the number of bytes then read
+	// requestHeader is set|add|replace|insert key <flags> <expiry> <valuelen> [noreply]\r\n<value>\r\n
+	args, err := splitArgsOnSpaces(requestHeader[:len(requestHeader)-2])
+	if err != nil {
+		return fmt.Errorf("could not parse %q: %v\n", string(requestHeader), err)
+	}
+	if len(args) < 6 || len(args) > 7 {
+		cmd := string(args[0])
+		return fmt.Errorf("unexpected word count %d for %s, expected '%s key flags expiry valuelen [noreply]'", len(args), cmd, cmd)
+	}
+
+	// TODO: use https://godoc.org/go4.org/strutil#ParseUintBytes
+	err = validateKeyFlagsExpiry(args)
+	if err != nil {
+		return err
+	}
+
+	length, err := strutil.ParseUintBytes(args[4], 10, 30)
+	if err != nil {
+		return fmt.Errorf("failed to parse length: %v", err)
+	}
+
+	_, err = strutil.ParseUintBytes(args[5], 10, 64)
+	if err != nil {
+		return fmt.Errorf("failed to parse cas token: %v", err)
+	}
+
+	if length < 0 {
+		return fmt.Errorf("Wrong length: expected non-negative value")
+	}
+	if length > MAX_ITEM_SIZE {
+		return fmt.Errorf("Wrong length: %d exceeds MAX_ITEM_SIZE of %d", length, MAX_ITEM_SIZE)
+	}
+	noreply := false
+	if len(args) == 7 {
+		if !bytes.Equal(args[6], noreplyBytes) {
 			return errors.New("expected extra arg to be noreply")
 		}
 		noreply = true
@@ -278,10 +375,6 @@ func handleCommand(reader *bufio.Reader, responses *responsequeue.ResponseQueue,
 		return errors.New("request too short")
 	}
 
-	i := bytes.IndexByte(header, ' ')
-	if i <= 1 {
-		return errors.New("empty request")
-	}
 	// If a client sends the carriage return in the wrong place, close that client,
 	// the client might not be properly validating keys.
 	carriageReturnPos := bytes.IndexByte(header, '\r')
@@ -291,6 +384,10 @@ func handleCommand(reader *bufio.Reader, responses *responsequeue.ResponseQueue,
 		} else {
 			return errors.New("request header had carriage return in an unexpected position")
 		}
+	}
+	i := bytes.IndexByte(header, ' ')
+	if i < 0 {
+		i = carriageReturnPos
 	}
 
 	// fmt.Fprintf(os.Stderr, "got request %q i=%d\n", header, i)
@@ -308,6 +405,13 @@ func handleCommand(reader *bufio.Reader, responses *responsequeue.ResponseQueue,
 			err := handleSet(header, reader, responses, remote)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "%s request parsing failed: %s\n", string(header[:3]), err.Error())
+			}
+			return err
+		}
+		if bytes.HasPrefix(header, requestCas) {
+			err := handleCas(header, reader, responses, remote)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "cas request parsing failed: %s\n", err.Error())
 			}
 			return err
 		}
@@ -331,6 +435,20 @@ func handleCommand(reader *bufio.Reader, responses *responsequeue.ResponseQueue,
 			err := handleIncrOrDecr(header, responses, remote)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "decr request parsing failed: %s\n", err.Error())
+			}
+			return err
+		}
+		if bytes.HasPrefix(header, requestQuit) {
+			// fmt.Fprintf(os.Stderr, "Got quit from client")
+			return errQuit
+		}
+	case 5:
+		if bytes.HasPrefix(header, requestTouch) {
+			// fmt.Fprintf(os.Stderr, "Got quit from client")
+			// 'touch <key> <expiry>[noreply]\r\n' is similar to incr
+			err := handleIncrOrDecr(header, responses, remote)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "touch request parsing failed: %s\n", err.Error())
 			}
 			return err
 		}
