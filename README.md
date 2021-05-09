@@ -57,6 +57,8 @@ Others have proposed adding multithreading support for twemproxy.
 
 https://github.com/Netflix/dynomite is a [fork of twemproxy](https://github.com/Netflix/dynomite/wiki/FAQ#is-this-a-fork-from-twemproxy) adding replication
 
+https://github.com/memcached/memcached/pull/716/files is a proposal to add an embedded memcache proxy to `memcached` 1.6 itself using the text/meta protocols
+
 ## TODOs
 
 - Support more hash algorithms - only one is supported right now.
