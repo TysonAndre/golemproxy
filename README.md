@@ -59,15 +59,27 @@ https://github.com/Netflix/dynomite is a [fork of twemproxy](https://github.com/
 
 https://github.com/memcached/memcached/pull/716/files is a proposal to add an embedded memcache proxy to `memcached` 1.6 itself using the text/meta protocols
 
+## Features
+
+- Supports ketama consistent hashing distribution
+- Support most of the memcache text protocol, including `noreply` requests. Has a similar feature set to https://github.com/twitter/twemproxy/blob/master/notes/memcache.md
+
 ## TODOs
 
 - Support more hash algorithms - only one is supported right now.
-- Support memcache `noreply` requests.
-- Finish supporting other memcache request types.
+- Support memcache `version` request.
 - Support more distributions other than ketama.
 - Support evicting hosts with `auto_eject_hosts: true`
 - Support redis
+- Support metatext protocol
 - Be more aggressive about validating if requests are correctly formatted
+
+## Unit testing
+
+Currently testing against https://github.com/ifwe/twemproxy/tree/master/tests for reference. `test_memcache` is passing.
+
+1. Build and copy `golemproxy` into `twemproxy/tests/_binaries/nutcracker`
+2. Run `./nosetests_verbose.sh test_memcache`
 
 ## Installing
 
@@ -78,6 +90,9 @@ go build
 ```
 
 ## Benchmarking
+
+Benchmark results show a higher maximum throughput for small commands than twemproxy on an 8-core machine.
+TODO: Test on machines with more cores.
 
 ```
 cd benchmark
